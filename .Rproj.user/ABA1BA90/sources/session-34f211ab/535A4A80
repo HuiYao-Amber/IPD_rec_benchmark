@@ -1,0 +1,27 @@
+{
+    "id": "535A4A80",
+    "path": "C:/Amber/JHU/km2ipd/Benchmark/R/single_trial_simulation_digitization.R",
+    "project_path": "R/single_trial_simulation_digitization.R",
+    "type": "r_source",
+    "hash": "3149786032",
+    "contents": "",
+    "dirty": false,
+    "created": 1771599286933.0,
+    "source_on_save": false,
+    "relative_order": 5,
+    "properties": {
+        "tempName": "Untitled1",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "301,36",
+        "scrollLine": "319"
+    },
+    "folds": "37|2|230|0|\n240|3|298|0|\n305|3|365|0|\n",
+    "lastKnownWriteTime": 1771562313,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1771599350248,
+    "read_only": false,
+    "read_only_alternatives": []
+}

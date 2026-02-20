@@ -1,0 +1,28 @@
+{
+    "id": "D060553C",
+    "path": null,
+    "project_path": null,
+    "type": "object_explorer",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1771568600258.0,
+    "source_on_save": false,
+    "relative_order": 5,
+    "properties": {
+        "id": "e43125ce5c4240fe9b75ec86c7c36deb",
+        "name": "sim2",
+        "title": "sim2",
+        "language": "R",
+        "source_window_id": "",
+        "Source": "Source"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 2534496588872,
+    "encoding": "",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1771568600258,
+    "read_only": false,
+    "read_only_alternatives": []
+}

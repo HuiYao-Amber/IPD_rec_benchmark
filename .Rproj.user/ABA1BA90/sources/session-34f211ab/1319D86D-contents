@@ -1,0 +1,512 @@
+#==============================================================#
+# Digitize KM plot using SurvdigitizeR
+#==============================================================#
+
+# Digitize a KM plot image into (time, survival) points.
+#
+# Returns a list with:
+#   $data   : data.frame/data.table with columns time, St, curve (+ optional arm)
+#   $plot   : path to saved QA PNG (or NA)
+#   $meta   : key digitization arguments
+digitize_km_image <- function(
+    img_path,
+    x_end,
+    mode = c("remove_censor_marks", "keep_censor_marks"),
+    num_curves = 2,
+    x_increment = NULL,
+    y_increment = 0.2,
+    bg_lightness = 0.4,
+    attempt_OCR = FALSE,
+    word_sensitivity = 30,
+    y_text_vertical = FALSE,
+    nr_neighbors = 20,
+    enhance = FALSE,
+    impute_size = 0,
+    line_censoring = FALSE,
+    seed = 2025,
+    make_plot = TRUE,
+    plot_out = sub("\\.png$", "_digitized_points.png", img_path),
+    # Optional: provide truth IPD for deterministic arm alignment in simulation
+    truth_ipd = NULL,
+    arm_var = "arm",
+    arm_levels = c("Control", "Treatment"),
+    # ... existing args ...,
+    enforce_hr_lt1 = TRUE,   # set TRUE in simulation where true HR < 1 always
+    swap_tol = 0.02,          # tolerance to avoid swapping when effect ~ 0
+    swap_grid_n = 200,        # grid points for estimating logHR direction
+    swap_eps = 1e-6           # numerical safeguard for log()
+){
+  mode <- match.arg(mode)
+
+  if (!requireNamespace("SurvdigitizeR", quietly = TRUE)) {
+    stop("Package 'SurvdigitizeR' is required for digitize_km_image().")
+  }
+
+  stopifnot(is.character(img_path), length(img_path) == 1L, file.exists(img_path))
+  stopifnot(is.finite(x_end), x_end > 0)
+
+  set.seed(seed)
+
+  if (is.null(x_increment)) x_increment <- x_end / 8
+  x_increment <- as.numeric(x_increment)[1]
+  y_increment <- as.numeric(y_increment)[1]
+
+  censoring_flag <- (mode == "remove_censor_marks")
+
+  # 初始化 meta 列表
+  meta <- list(
+    img_path = img_path,
+    x_end = x_end,
+    x_increment = x_increment,
+    y_increment = y_increment,
+    mode = mode,
+    num_curves = num_curves,
+    bg_lightness = bg_lightness,
+    attempt_OCR = attempt_OCR,
+    word_sensitivity = word_sensitivity,
+    y_text_vertical = y_text_vertical,
+    nr_neighbors = nr_neighbors,
+    enhance = enhance,
+    impute_size = impute_size,
+    line_censoring = line_censoring,
+    seed = seed
+  )
+
+  out <- tryCatch(
+    SurvdigitizeR::survival_digitize(
+      img_path = img_path,
+      bg_lightness = as.numeric(bg_lightness)[1],
+      attempt_OCR = as.logical(attempt_OCR)[1],
+      word_sensitivity = as.numeric(word_sensitivity)[1],
+      num_curves = as.integer(num_curves)[1],
+      censoring = as.logical(censoring_flag)[1],
+      x_start = 0,
+      x_end = as.numeric(x_end)[1],
+      x_increment = x_increment,
+      y_start = 0,
+      y_end = 1,
+      y_increment = y_increment,
+      y_text_vertical = as.logical(y_text_vertical)[1],
+      nr_neighbors = as.integer(nr_neighbors)[1],
+      enhance = as.logical(enhance)[1],
+      impute_size = as.integer(impute_size)[1],
+      line_censoring = as.logical(line_censoring)[1]
+    ),
+    error = function(e){
+      warning(sprintf("[SurvdigitizeR failed] %s", e$message))
+      return(NULL)
+    }
+  )
+  if (is.null(out)) return(NULL)
+
+  # 统一转换为 data.table（你已加载 data.table，直接使用）
+  dt <- data.table::as.data.table(out)
+  if ("times" %in% names(dt)) data.table::setnames(dt, "times", "time")
+  if (!all(c("time", "St", "curve") %in% names(dt))) return(NULL)
+
+  # 基本清理
+  dt <- dt[is.finite(time) & is.finite(St)]
+  dt <- dt[time >= 0 & time <= x_end]
+  dt[, St := pmax(pmin(St, 1), 0)]
+  data.table::setorder(dt, curve, time)
+  dt[, St := cummin(St), by = curve]
+
+  # ---- 可选：强制曲线 1 = 对照，曲线 2 = 治疗（当真实 HR < 1 时） ----
+  if (isTRUE(enforce_hr_lt1) && "curve" %in% names(dt) &&
+      length(unique(dt$curve)) >= 2) {
+
+    # 局部函数：从数字化 KM 估计 logHR 方向
+    estimate_logHR_from_KM <- function(dt, ctrl_curve = 1, trt_curve = 2,
+                                       grid_n = 200, eps = 1e-6) {
+      prep_one <- function(df) {
+        df <- df[is.finite(df$time) & is.finite(df$St), .(time, St)]
+        df <- df[order(time)]
+        # 去重（保留每个时间的最后一个 St）
+        df <- df[, .(St = St[.N]), by = time]
+        # 添加 (0,1) 如果缺失
+        if (!any(df$time == 0)) df <- rbind(data.table(time = 0, St = 1), df)
+        df <- df[order(time)]
+        df[, St := pmin(1, pmax(0, St))]
+        df[, St := cummin(St)]
+        df
+      }
+
+      cdf <- prep_one(dt[curve == ctrl_curve])
+      tdf <- prep_one(dt[curve == trt_curve])
+
+      if (nrow(cdf) < 3 || nrow(tdf) < 3) return(NA_real_)
+
+      tmax <- min(max(cdf$time), max(tdf$time))
+      if (!is.finite(tmax) || tmax <= 0) return(NA_real_)
+
+      tg <- seq(0, tmax, length.out = grid_n)
+
+      # 用 step 函数近似
+      Sc <- stats::approx(cdf$time, cdf$St, xout = tg, method = "constant", f = 0, rule = 2)$y
+      St <- stats::approx(tdf$time, tdf$St, xout = tg, method = "constant", f = 0, rule = 2)$y
+
+      Sc <- pmin(1 - eps, pmax(eps, Sc))
+      St <- pmin(1 - eps, pmax(eps, St))
+
+      Hc <- -log(Sc)
+      Ht <- -log(St)
+
+      ok <- is.finite(Hc) & is.finite(Ht) & (Hc > 0) & (Ht > 0)
+      if (!any(ok)) return(NA_real_)
+
+      beta_t <- log(Ht[ok] / Hc[ok])
+      beta_t <- beta_t[is.finite(beta_t)]
+      if (!length(beta_t)) return(NA_real_)
+
+      stats::median(beta_t)
+    }
+
+    curves <- sort(unique(dt$curve))
+    c1 <- curves[1]
+    c2 <- curves[2]
+
+    beta_hat <- estimate_logHR_from_KM(dt, ctrl_curve = c1, trt_curve = c2,
+                                       grid_n = swap_grid_n, eps = swap_eps)
+
+    swapped <- FALSE
+    if (is.finite(beta_hat) && beta_hat > swap_tol) {
+      # 交换曲线标签，使治疗组风险比 < 1（即治疗组曲线应在对照组下方）
+      dt$curve <- ifelse(dt$curve == c1, c2,
+                         ifelse(dt$curve == c2, c1, dt$curve))
+      swapped <- TRUE
+    }
+
+    # 记录交换信息到 meta
+    meta$curve_swapped <- swapped
+    meta$digitized_logHR_hat <- beta_hat
+  }
+
+  # --- 可选生成 QA 图 ---
+  plot_path <- NA_character_
+  if (isTRUE(make_plot)) {
+    plot_path <- plot_out
+    dir.create(dirname(plot_path), recursive = TRUE, showWarnings = FALSE)
+
+    ok <- TRUE
+    tryCatch({
+      grDevices::png(plot_path, width = 1400, height = 900, res = 150)
+    }, error = function(e){
+      ok <<- FALSE
+      warning(sprintf("Could not start png device: %s", e$message))
+    })
+
+    if (ok) {
+      on.exit(grDevices::dev.off(), add = TRUE)
+
+      graphics::plot(
+        0, 0, type = "n",
+        xlim = c(0, x_end), ylim = c(0, 1),
+        xlab = "Time", ylab = "Survival",
+        main = "Digitized KM points"
+      )
+      graphics::grid()
+
+      curves <- sort(unique(dt$curve))
+      cols <- c("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e")
+
+      for (i in seq_along(curves)) {
+        dd <- dt[curve == curves[i]]
+        graphics::points(dd$time, dd$St, pch = 16, cex = 0.7, col = cols[(i - 1) %% length(cols) + 1])
+        graphics::lines(dd$time, dd$St, col = cols[(i - 1) %% length(cols) + 1], lwd = 1)
+      }
+
+      # 如果后续有 arm 信息可添加图例（此处未用，可保留）
+      # if ("arm" %in% names(dt)) { ... }
+    } else {
+      plot_path <- NA_character_
+    }
+  }
+
+  # 返回最终列表
+  list(
+    data = dt,
+    plot = plot_path,
+    meta = meta
+  )
+}
+
+
+
+# digitize_km_image <- function(
+#     img_path,
+#     x_end,
+#     mode = c("remove_censor_marks", "keep_censor_marks"),
+#     num_curves = 2,
+#     x_increment = NULL,
+#     y_increment = 0.2,
+#     bg_lightness = 0.4,
+#     attempt_OCR = FALSE,
+#     word_sensitivity = 30,
+#     y_text_vertical = FALSE,
+#     nr_neighbors = 20,
+#     enhance = FALSE,
+#     impute_size = 0,
+#     line_censoring = FALSE,
+#     seed = 2025,
+#     make_plot = TRUE,
+#     plot_out = sub("\\.png$", "_digitized_points.png", img_path),
+#     # Optional: provide truth IPD for deterministic arm alignment in simulation
+#     truth_ipd = NULL,
+#     arm_var = "arm",
+#     arm_levels = c("Control", "Treatment"),
+#     # ... existing args ...,
+#     enforce_hr_lt1 = TRUE,   # set TRUE in simulation where true HR < 1 always
+#     swap_tol = 0.02,          # tolerance to avoid swapping when effect ~ 0
+#     swap_grid_n = 200,        # grid points for estimating logHR direction
+#     swap_eps = 1e-6           # numerical safeguard for log()
+# ){
+#   mode <- match.arg(mode)
+#
+#   if (!requireNamespace("SurvdigitizeR", quietly = TRUE)) {
+#     stop("Package 'SurvdigitizeR' is required for digitize_km_image().")
+#   }
+#
+#   stopifnot(is.character(img_path), length(img_path) == 1L, file.exists(img_path))
+#   stopifnot(is.finite(x_end), x_end > 0)
+#
+#   set.seed(seed)
+#
+#   if (is.null(x_increment)) x_increment <- x_end / 8
+#   x_increment <- as.numeric(x_increment)[1]
+#   y_increment <- as.numeric(y_increment)[1]
+#
+#   censoring_flag <- (mode == "remove_censor_marks")
+#
+#   out <- tryCatch(
+#     SurvdigitizeR::survival_digitize(
+#       img_path = img_path,
+#       bg_lightness = as.numeric(bg_lightness)[1],
+#       attempt_OCR = as.logical(attempt_OCR)[1],
+#       word_sensitivity = as.numeric(word_sensitivity)[1],
+#       num_curves = as.integer(num_curves)[1],
+#       censoring = as.logical(censoring_flag)[1],
+#       x_start = 0,
+#       x_end = as.numeric(x_end)[1],
+#       x_increment = x_increment,
+#       y_start = 0,
+#       y_end = 1,
+#       y_increment = y_increment,
+#       y_text_vertical = as.logical(y_text_vertical)[1],
+#       nr_neighbors = as.integer(nr_neighbors)[1],
+#       enhance = as.logical(enhance)[1],
+#       impute_size = as.integer(impute_size)[1],
+#       line_censoring = as.logical(line_censoring)[1]
+#     ),
+#     error = function(e){
+#       warning(sprintf("[SurvdigitizeR failed] %s", e$message))
+#       return(NULL)
+#     }
+#   )
+#   if (is.null(out)) return(NULL)
+#
+#   # Keep output format consistent: time / St / curve
+#   if (requireNamespace("data.table", quietly = TRUE)) {
+#     dt <- data.table::as.data.table(out)
+#     if ("times" %in% names(dt)) data.table::setnames(dt, "times", "time")
+#     if (!all(c("time", "St", "curve") %in% names(dt))) return(NULL)
+#
+#     # Minimal sanity clamps (do NOT do heavy "cleaning")
+#     dt <- dt[is.finite(time) & is.finite(St)]
+#     dt <- dt[time >= 0 & time <= x_end]
+#     dt[, St := pmax(pmin(St, 1), 0)]
+#     data.table::setorder(dt, curve, time)
+#     dt[, St := cummin(St), by = curve]
+#   } else {
+#     dt <- as.data.frame(out)
+#     if ("times" %in% names(dt)) names(dt)[names(dt) == "times"] <- "time"
+#     if (!all(c("time", "St", "curve") %in% names(dt))) return(NULL)
+#
+#     dt <- dt[is.finite(dt$time) & is.finite(dt$St), , drop = FALSE]
+#     dt <- dt[dt$time >= 0 & dt$time <= x_end, , drop = FALSE]
+#     dt$St <- pmax(pmin(dt$St, 1), 0)
+#     dt <- dt[order(dt$curve, dt$time), , drop = FALSE]
+#     dt$St <- ave(dt$St, dt$curve, FUN = cummin)
+#   }
+#
+#   # ---- Optional: enforce curve 1 = Control, curve 2=Treatment when true HR < 1 ----
+# if (isTRUE(enforce_hr_lt1) && is.data.frame(dt) && "curve" %in% names(digi_dt) &&
+#     length(unique(digi_dt$curve)) >= 2) {
+#
+#   # local helper: estimate logHR direction from digitized KM only
+#   estimate_logHR_from_KM <- function(dt, ctrl_curve = 1, trt_curve = 2,
+#                                      grid_n = 200, eps = 1e-6) {
+#
+#     prep_one <- function(df) {
+#       df <- df[is.finite(df$time) & is.finite(df$St), c("time","St")]
+#       df <- df[order(df$time), , drop = FALSE]
+#
+#       # keep the last St at each time to remove duplicated time
+#       df <- aggregate(St ~ time, df, FUN = function(z) z[length(z)])
+#
+#       # add (0,1) if missing
+#       if (!any(df$time == 0)) df <- rbind(data.frame(time = 0, St = 1), df)
+#       df <- df[order(df$time), , drop = FALSE]
+#
+#       # clamp and enforce non-increasing survival (only for direction estimation)
+#       df$St <- pmin(1, pmax(0, df$St))
+#       df$St <- cummin(df$St)
+#       df
+#     }
+#
+#     cdf <- prep_one(dt[dt$curve == ctrl_curve, ])
+#     tdf <- prep_one(dt[dt$curve == trt_curve, ])
+#
+#     if (nrow(cdf) < 3 || nrow(tdf) < 3) return(NA_real_)
+#
+#     tmax <- min(max(cdf$time), max(tdf$time))
+#     if (!is.finite(tmax) || tmax <= 0) return(NA_real_)
+#
+#     tg <- seq(0, tmax, length.out = grid_n)
+#
+#     # KM is a step function; approximate with piecewise-constant
+#     Sc <- stats::approx(cdf$time, cdf$St, xout = tg, method = "constant", f = 0, rule = 2)$y
+#     St <- stats::approx(tdf$time, tdf$St, xout = tg, method = "constant", f = 0, rule = 2)$y
+#
+#     # avoid log(0) and log(1) issues: drop where H=0
+#     Sc <- pmin(1 - eps, pmax(eps, Sc))
+#     St <- pmin(1 - eps, pmax(eps, St))
+#
+#     Hc <- -log(Sc)
+#     Ht <- -log(St)
+#
+#     ok <- is.finite(Hc) & is.finite(Ht) & (Hc > 0) & (Ht > 0)
+#     if (!any(ok)) return(NA_real_)
+#
+#     beta_t <- log(Ht[ok] / Hc[ok])
+#     beta_t <- beta_t[is.finite(beta_t)]
+#     if (!length(beta_t)) return(NA_real_)
+#
+#     stats::median(beta_t)
+#   }
+#
+#   # infer which curve IDs exist (usually 1 and 2)
+#   curves <- sort(unique(digi_dt$curve))
+#   c1 <- curves[1]; c2 <- curves[2]
+#
+#   beta_hat <- estimate_logHR_from_KM(digi_dt, ctrl_curve = c1, trt_curve = c2,
+#                                     grid_n = swap_grid_n, eps = swap_eps)
+#
+#   swapped <- FALSE
+#   if (is.finite(beta_hat) && beta_hat > swap_tol) {
+#     # swap curve labels so that Treatment has lower hazard (HR<1) under Control=1, Treatment=2 convention
+#     digi_dt$curve <- ifelse(digi_dt$curve == c1, c2,
+#                             ifelse(digi_dt$curve == c2, c1, digi_dt$curve))
+#     swapped <- TRUE
+#   }
+#
+#   # record for debugging (does not affect reconstruction interfaces)
+#   if (is.list(meta)) {
+#     meta$curve_swapped <- swapped
+#     meta$digitized_logHR_hat <- beta_hat
+#   }
+# }
+#
+#   # --- Optional QA plot (simple; not raster overlay) ---
+#   plot_path <- NA_character_
+#   if (isTRUE(make_plot)) {
+#     plot_path <- plot_out
+#
+#     # Ensure directory exists
+#     dir.create(dirname(plot_path), recursive = TRUE, showWarnings = FALSE)
+#
+#     ok <- TRUE
+#     tryCatch({
+#       grDevices::png(plot_path, width = 1400, height = 900, res = 150)
+#     }, error = function(e){
+#       ok <<- FALSE
+#       warning(sprintf("Could not start png device: %s", e$message))
+#     })
+#
+#     if (ok) {
+#       on.exit(grDevices::dev.off(), add = TRUE)
+#
+#       # Base plot
+#       graphics::plot(
+#         0, 0, type = "n",
+#         xlim = c(0, x_end), ylim = c(0, 1),
+#         xlab = "Time", ylab = "Survival",
+#         main = "Digitized KM points"
+#       )
+#       graphics::grid()
+#
+#       curves <- sort(unique(dt$curve))
+#       cols <- c("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e")
+#
+#       for (i in seq_along(curves)) {
+#         if (inherits(dt, "data.table")) {
+#           dd <- dt[curve == curves[i]]
+#         } else {
+#           dd <- dt[dt$curve == curves[i], , drop = FALSE]
+#         }
+#         graphics::points(dd$time, dd$St, pch = 16, cex = 0.7, col = cols[(i - 1) %% length(cols) + 1])
+#         graphics::lines(dd$time, dd$St, col = cols[(i - 1) %% length(cols) + 1], lwd = 1)
+#       }
+#
+#       # If aligned arms exist, show legend with arm labels
+#       if ("arm" %in% names(dt)) {
+#         leg <- unique(dt[, c("curve", "arm")])
+#         if (inherits(leg, "data.table")) leg <- as.data.frame(leg)
+#         leg <- leg[order(leg$curve), , drop = FALSE]
+#         graphics::legend(
+#           "topright",
+#           legend = paste0("curve ", leg$curve, ": ", leg$arm),
+#           col = cols[seq_len(nrow(leg))],
+#           pch = 16,
+#           bty = "n"
+#         )
+#       }
+#
+#
+#     } else {
+#       plot_path <- NA_character_
+#     }
+#   }
+#
+#   list(
+#     data = dt,
+#     plot = plot_path,
+#     meta = list(
+#       img_path = img_path,
+#       x_end = x_end,
+#       x_increment = x_increment,
+#       y_increment = y_increment,
+#       mode = mode,
+#       num_curves = num_curves,
+#       bg_lightness = bg_lightness,
+#       attempt_OCR = attempt_OCR,
+#       word_sensitivity = word_sensitivity,
+#       y_text_vertical = y_text_vertical,
+#       nr_neighbors = nr_neighbors,
+#       enhance = enhance,
+#       impute_size = impute_size,
+#       line_censoring = line_censoring,
+#       seed = seed
+#     )
+#   )
+# }
+
+
+#--------------------------------------------------------------#
+# Minimal usage example
+#--------------------------------------------------------------#
+
+library(here)
+
+# 3) Digitize the KM image produced by simulate_trial
+digi <- digitize_km_image(
+  img_path = res3$km_png,
+  x_end = res3$axis$x_end_plot,
+  x_increment = res3$axis$x_increment,
+  mode = "keep_censor_marks",
+  num_curves = 2,
+  make_plot = TRUE
+)
+
+digi$data
+digi$plot
+names(digi)

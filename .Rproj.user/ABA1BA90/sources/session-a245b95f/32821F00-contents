@@ -1,0 +1,240 @@
+## =========================
+## meta_sim_v3_analysis.R
+## =========================
+
+library(data.table)
+library(ggplot2)
+
+## 假设你已经有：
+## sim$res_methods_long (data.table)
+## sim$res_studies_long (data.table)
+
+m <- as.data.table(sim$res_methods_long)
+s <- as.data.table(sim$res_studies_long)
+
+mu_HR <- 0.75
+mu_logHR <- log(mu_HR)
+
+## -------------------------
+## 0) 快速 sanity check
+## -------------------------
+stopifnot(all(c("scenario_id","method","logHR_hat","se_hat","p_miss","tau_label","n_label","K","rep","ok") %in% names(m)))
+stopifnot(all(c("scenario_id","trial","logHR_true_hat","logHR_recon_hat","se_true_hat","se_recon_hat","is_missing","rep") %in% names(s)))
+
+## 只分析成功的 meta 拟合
+m_ok <- m[ok == TRUE & is.finite(logHR_hat) & is.finite(se_hat)]
+s_ok <- s[true_ok == TRUE & recon_ok == TRUE &
+            is.finite(logHR_true_hat) & is.finite(logHR_recon_hat)]
+
+## =========================
+## 1) 方法层：bias / rmse / coverage / SE / k_used
+## =========================
+m_ok[, `:=`(
+  err_log = logHR_hat - mu_logHR,
+  abs_err = abs(logHR_hat - mu_logHR),
+  sq_err  = (logHR_hat - mu_logHR)^2,
+  HR_hat  = exp(logHR_hat),
+  ci_lo   = logHR_hat - 1.96 * se_hat,
+  ci_hi   = logHR_hat + 1.96 * se_hat,
+  covered = (logHR_hat - 1.96 * se_hat <= mu_logHR) & (mu_logHR <= logHR_hat + 1.96 * se_hat)
+)]
+
+
+
+perf <- m_ok[, .(
+  n_rep = .N,
+  bias_log = mean(err_log),
+  abs_bias_log = mean(abs_err),
+  rmse_log = sqrt(mean(sq_err)),
+  mean_se = mean(se_hat),
+  sd_est = sd(logHR_hat),
+  coverage = mean(covered),
+  mean_k_used = mean(k_used, na.rm = TRUE),
+  fail_rate = 1 - mean(ok),
+  err_log = err_log  # 这行保留 rep-level error，后续可以分析 error distribution
+), by = .(scenario_id, p_miss, tau_label, n_label, n_per_arm, K, method)]
+
+
+## 如果你更想看 HR 尺度（不如 log 稳，但直观）：
+perf[, `:=`(
+  bias_HR = mean(exp(mu_logHR + err_log) - mu_HR),   # 近似：这行用 rep-level 更准，这里先给一个直观指标
+  rmse_HR = NA_real_
+)]
+
+
+## 更严格的 HR RMSE：从原数据算
+tmp_HR <- m_ok[, .(HR_hat = exp(logHR_hat)), by=.(scenario_id,p_miss,tau_label,n_label,n_per_arm,K,method,rep)]
+perf_HR <- tmp_HR[, .(
+  bias_HR = mean(HR_hat - mu_HR),
+  rmse_HR = sqrt(mean((HR_hat - mu_HR)^2))
+), by=.(scenario_id,p_miss,tau_label,n_label,n_per_arm,K,method)]
+perf <- merge(perf, perf_HR, by=c("scenario_id","p_miss","tau_label","n_label","n_per_arm","K","method"), all.x=TRUE)
+
+## 你要的“按 missing 分层看 trend”的主表：
+perf_trend <- perf[order(tau_label, p_miss, method)]
+
+print(perf_trend)
+
+## =========================
+## 2) 画 meeting 核心图：bias & rmse trend（4条线）
+## =========================
+
+## 2.1 bias(logHR) vs p_miss, facet by tau
+p1 <- ggplot(perf_trend, aes(x = p_miss, y = bias_log, group = method, linetype = method)) +
+  geom_hline(yintercept = 0) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ tau_label) +
+  labs(x = "Missing HR proportion (p_miss)",
+       y = "Bias (logHR_hat - log(0.75))",
+       title = "Meta-estimator bias vs missingness",
+       linetype = "Method") +
+  theme_bw()
+
+## 2.2 RMSE(logHR) vs p_miss
+p2 <- ggplot(perf_trend, aes(x = p_miss, y = rmse_log, group = method, linetype = method)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ tau_label) +
+  labs(x = "Missing HR proportion (p_miss)",
+       y = "RMSE on logHR scale",
+       title = "Meta-estimator RMSE vs missingness",
+       linetype = "Method") +
+  theme_bw()
+
+## 2.3 也可以画 HR 尺度（更直观）
+p3 <- ggplot(perf_trend, aes(x = p_miss, y = bias_HR, group = method, linetype = method)) +
+  geom_hline(yintercept = 0) +
+  geom_line() + geom_point() +
+  facet_wrap(~ tau_label) +
+  labs(x = "p_miss", y = "Bias (HR_hat - 0.75)", title = "Bias on HR scale") +
+  theme_bw()
+
+p4 <- ggplot(perf_trend, aes(x = p_miss, y = rmse_HR, group = method, linetype = method)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ tau_label) +
+  labs(x = "p_miss", y = "RMSE on HR scale", title = "RMSE on HR scale") +
+  theme_bw()
+
+print(p1); print(p2); print(p3); print(p4)
+
+## =========================
+## 3) 为什么 AD-only 变差：k_used 和 SE 的机制解释图
+## =========================
+
+## 3.1 k_used vs p_miss
+
+p_k <- ggplot(perf_trend, aes(x = p_miss, y = mean_k_used, group = method, linetype = method)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ tau_label) +
+  labs(x = "p_miss", y = "Mean number of studies used (k_used)",
+       title = "How many studies each method uses") +
+  theme_bw()
+
+## 3.2 mean SE vs p_miss
+p_se <- ggplot(perf_trend, aes(x = p_miss, y = mean_se, group = method, linetype = method)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ tau_label) +
+  labs(x = "p_miss", y = "Mean SE of meta logHR",
+       title = "Precision loss under missingness") +
+  theme_bw()
+
+print(p_k); print(p_se)
+
+## 3.3 关联：rep-level rmse 与 k_used（尤其看 AD-only）
+rep_level <- m_ok[, .(
+  logHR_hat = logHR_hat,
+  se_hat = se_hat,
+  k_used = k_used
+), by=.(scenario_id,p_miss,tau_label,method,rep)]
+
+rep_level[, err_log := logHR_hat - mu_logHR]
+
+p_scatter <- ggplot(rep_level[method == "AD_only"],
+                    aes(x = k_used, y = abs(err_log))) +
+  geom_point(alpha = 0.35) +
+  facet_wrap(~ p_miss) +
+  labs(x="k_used (AD-only)", y="|error| on logHR", title="AD-only error increases when fewer studies are used") +
+  theme_bw()
+
+print(p_scatter)
+
+## =========================
+## 4) Trial-level：重建误差是否主导（true vs recon）
+## =========================
+
+s_ok[, `:=`(
+  diff_log = logHR_recon_hat - logHR_true_hat,
+  avg_log  = 0.5*(logHR_recon_hat + logHR_true_hat),
+  abs_diff = abs(logHR_recon_hat - logHR_true_hat)
+)]
+
+## 4.1 scatter：true vs recon（按 missing 分层更好解释 Hybrid）
+p_sc1 <- ggplot(s_ok, aes(x = logHR_true_hat, y = logHR_recon_hat)) +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0) +
+  facet_wrap(~ is_missing) +
+  labs(x="Trial logHR from TRUE IPD (Cox)", y="Trial logHR from RECON IPD (Cox)",
+       title="Trial-level agreement: TRUE vs RECON") +
+  theme_bw()
+print(p_sc1)
+
+## 4.2 Bland–Altman：diff vs average
+p_ba <- ggplot(s_ok, aes(x = avg_log, y = diff_log)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~ is_missing) +
+  labs(x="Average(logHR_true, logHR_recon)", y="logHR_recon - logHR_true",
+       title="Bland-Altman: reconstruction error pattern") +
+  theme_bw()
+print(p_ba)
+
+## 4.3 汇总：重建误差大小（按 scenario / missing）
+recon_err_sum <- s_ok[, .(
+  mean_diff = mean(diff_log),
+  sd_diff   = sd(diff_log),
+  mae       = mean(abs_diff),
+  rmse      = sqrt(mean(diff_log^2))
+), by=.(scenario_id, p_miss, tau_label, is_missing)]
+
+print(recon_err_sum[order(tau_label,p_miss,is_missing)])
+
+## =========================
+## 5) 更贴近 paper story 的对比：Hybrid 相对 AD-only 的增益
+## =========================
+
+## 5.1 直接用 perf_trend 做 delta
+wide_bias <- dcast(perf_trend, scenario_id + p_miss + tau_label + n_label + K ~ method,
+                   value.var = "rmse_log")
+wide_bias[, `:=`(
+  gain_Hybrid_vs_AD = AD_only - Hybrid,  # >0 表示 Hybrid 更好（RMSE更小）
+  gain_RM_vs_AD     = AD_only - RM
+)]
+
+p_gain <- ggplot(wide_bias, aes(x=p_miss, y=gain_Hybrid_vs_AD, group=tau_label, linetype=tau_label)) +
+  geom_hline(yintercept = 0) +
+  geom_line() + geom_point() +
+  labs(x="p_miss", y="RMSE reduction (AD_only - Hybrid) on logHR",
+       title="How much Hybrid improves over AD-only") +
+  theme_bw()
+print(p_gain)
+
+## =========================
+## 6) 保存输出（可选）
+## =========================
+out_dir <- "meta_sim_v3_analysis_outputs"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+fwrite(perf_trend, file.path(out_dir, "perf_trend.csv"))
+fwrite(recon_err_sum, file.path(out_dir, "recon_error_summary.csv"))
+fwrite(wide_bias, file.path(out_dir, "gain_summary.csv"))
+
+ggsave(file.path(out_dir, "bias_logHR_trend.png"), p1, width=8, height=4, dpi=300)
+ggsave(file.path(out_dir, "rmse_logHR_trend.png"), p2, width=8, height=4, dpi=300)
+ggsave(file.path(out_dir, "k_used_trend.png"), p_k, width=8, height=4, dpi=300)
+ggsave(file.path(out_dir, "mean_se_trend.png"), p_se, width=8, height=4, dpi=300)
+ggsave(file.path(out_dir, "true_vs_recon_scatter.png"), p_sc1, width=8, height=4, dpi=300)
+ggsave(file.path(out_dir, "bland_altman.png"), p_ba, width=8, height=4, dpi=300)
+ggsave(file.path(out_dir, "hybrid_gain.png"), p_gain, width=6, height=4, dpi=300)
+
+message("Saved analysis outputs to: ", out_dir)
