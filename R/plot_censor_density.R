@@ -3,16 +3,16 @@
 # Requires: source("single_trial_simulation_DGM_informSplit.R") (or your DGM file)
 
 plot_censor_density_case <- function(
-  scenario_id,
-  scenario_lib,
-  n_control = 250,
-  n_treatment = 250,
-  censoring = c("random","exp","front","back","informative_front","informative_back"),
-  target_censoring = 0.30,
-  seed = 1,
-  out_dir = ".",
-  prefix = "demo",
-  dpi = 300
+    scenario_id,
+    scenario_lib,
+    n_control = 250,
+    n_treatment = 250,
+    censoring = c("random","exp","front","back","informative_front","informative_back","informative"),
+    target_censoring = 0.30,
+    seed = 1,
+    out_dir = ".",
+    prefix = "demo",
+    dpi = 300
 ){
   censoring <- match.arg(censoring)
 
@@ -133,10 +133,10 @@ plot_censor_density_case <- function(
     { if (!is.null(pdf_df)) ggplot2::geom_line(data = pdf_df, ggplot2::aes(x, y),
                                                linewidth = 1.1, color = "black") } +
     { if (!is.null(pdf_df)) ggplot2::geom_text(
-        data = pdf_df[256, , drop = FALSE],
-        ggplot2::aes(x, y, label = unique(pdf_df$label)),
-        vjust = -1.0, size = 3.2, color = "black"
-      ) } +
+      data = pdf_df[256, , drop = FALSE],
+      ggplot2::aes(x, y, label = unique(pdf_df$label)),
+      vjust = -1.0, size = 3.2, color = "black"
+    ) } +
     { if (!is.null(emp_gen)) ggplot2::geom_line(data = emp_gen, ggplot2::aes(x, y),
                                                 linetype = "dashed", color = "grey40") } +
     { if (!is.null(emp_obs)) ggplot2::geom_line(data = emp_obs, ggplot2::aes(x, y, color = arm),
@@ -171,17 +171,17 @@ plot_censor_density_case <- function(
 
 # Convenience: draw all 6 mechanisms for the SAME scenario + seed
 plot_censor_density_all <- function(
-  scenario_id,
-  scenario_lib,
-  n_control = 250,
-  n_treatment = 250,
-  target_censoring = 0.30,
-  seed = 1,
-  out_dir = ".",
-  prefix = "demo",
-  dpi = 300
+    scenario_id,
+    scenario_lib,
+    n_control = 250,
+    n_treatment = 250,
+    target_censoring = 0.30,
+    seed = 1,
+    out_dir = ".",
+    prefix = "demo",
+    dpi = 300
 ){
-  mechs <- c("random","exp","front","back","informative_front","informative_back")
+  mechs <- c("random","exp","front","back","informative_front","informative_back","informative")
   out <- lapply(mechs, function(cc){
     plot_censor_density_case(
       scenario_id = scenario_id,

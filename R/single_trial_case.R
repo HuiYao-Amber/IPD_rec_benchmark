@@ -1,44 +1,52 @@
 
-out_dir_demo <- "R/single_trial_case_demo"
+out_dir_demo <- "R/single_trial_case_demo0226"
 lib <- make_scenario_library(mean_time = 10)
-
-
 seed_run <- 1
-res3 <- simulate_trial(
+
+res1 <- simulate_trial(
   scenario_id = "W_shape0p6_HR067",
   scenario_lib = lib,
   n_control = 250,
   n_treatment = 250,
-  censoring = "exp",
+  censoring = "random",
   target_censoring = 0.30,
+  # censor_par = list(a = 0.7, b = 2.0, p = 1.0),
   seed = seed_run,
   out_dir = out_dir_demo,
-  prefix = "W_shape0p6_HR067_exp_c030_n250_seed1",
+  prefix = "W_shape0p6_HR067_c030_n250_seed1",
   plot = "km",
   add_censor_marks = FALSE
 )
 
+plot_censor_density_case(
+  scenario_id = "W_shape0p6_HR067",
+  scenario_lib = lib,
+  n_control = 250,
+  n_treatment = 250,
+  censoring = "informative_front",
+  target_censoring = 0.30,
+  seed = seed_run,
+  out_dir = out_dir_demo,
+  prefix = "censor"
+)
 
-# 新调用（使用数值模拟）
-digi <- digitize_km_event_times(
-  ipd_true = res3$ipd,
-  sd_S = 0.04,
-  seed = seed_run + 1L
+plot_censor_density_all(
+  scenario_id = "W_shape0p6_HR067",
+  scenario_lib = lib,
+  n_control = 250,
+  n_treatment = 250,
+  target_censoring = 0.30,
+  seed = seed_run,
+  out_dir = out_dir_demo,
+  prefix = "all_censor"
 )
 
 
-# digi <- digitize_km_dense(
-#   ipd_true = res3$ipd,
-#   x_end = res3$axis$x_end_plot,
-#   n_points = 150,          # 可根据需要调整
-#   sd_S = 0.04,             # 噪声水平，0.02–0.05 较合适
-#   seed = seed_run + 1L
-# )
 
 # digi <- digitize_km_image(
-#   img_path = res3$km_png,
-#   x_end = res3$axis$x_end_plot,
-#   x_increment = res3$axis$x_increment,
+#   img_path = res1$km_png,
+#   x_end = res1$axis$x_end_plot,
+#   x_increment = res1$axis$x_increment,
 #   y_increment = 0.2,
 #   mode = "keep_censor_marks",
 #   num_curves = 2,
@@ -49,42 +57,64 @@ digi <- digitize_km_event_times(
 #   plot_out = file.path(out_dir_demo, "digitized_points.png")
 # )
 
-rec1 <- reconstruct_ipd_twoarm(digi, res3$risk_table, method = "IPDfromKM",
-                               curve_map = c(Control = 1, Treatment = 2))
-rec2 <- reconstruct_ipd_twoarm(digi, res3$risk_table, method = "kmdata",
-                               curve_map = c(Control = 1, Treatment = 2))
-rec3 <- reconstruct_ipd_twoarm(digi, res3$risk_table, method = "KMtoIPD",
-                               curve_map = c(Control = 1, Treatment = 2))
 
-m1 <- evaluate_one_method(res3$ipd, digi$data, rec1$ipd, res3$risk_table, tau = tau, curve_map = curve_map, do_rmst = FALSE)
-m2 <- evaluate_one_method(res3$ipd, digi$data, rec2$ipd, res3$risk_table, tau = tau, curve_map = curve_map, do_rmst = FALSE)
-m3 <- evaluate_one_method(res3$ipd, digi$data, rec3$ipd, res3$risk_table, tau = tau, curve_map = curve_map, do_rmst = FALSE)
-
-as.data.frame(
-  method = c("IPDfromKM", "kmdata", "KMtoIPD"),
-  rbind(m1, m2, m3)
+digi <- digitize_km_event_times(
+  ipd_true = res1$ipd,
+  sd_S = 0.04,
+  seed = seed_run + 1L,
+  risk_table = res1$risk_table,
+  mark_merge_eps = 0.01
 )
 
-as.data.frame(
-  method = c("IPDfromKM", "KMtoIPD"),
-  rbind(m1, m3)
-)
 
-out_png <- file.path("C:/Amber/JHU/km2ipd/Benchmark/R/single_trial_case_demo",
-                     "sanity_W_shape0p6_HR067_exp_c030_n250_seed1.png")
+length(digi$data$time)
+print(res1$risk_table)
+
+rec1 <- reconstruct_ipd_twoarm(digi, res1$risk_table, method = "IPDfromKM",
+                               curve_map = c(Control = 1, Treatment = 2))
+rec2 <- reconstruct_ipd_twoarm(digi, res1$risk_table, method = "kmdata",
+                               total_events = c(Control = res1$totals$total_events_ctrl,
+                                                Treatment = res1$totals$total_events_trt),
+                               curve_map = c(Control = 1, Treatment = 2))
+
+# Scenario A: no marks
+rec3a <- reconstruct_ipd_twoarm(digi, res1$risk_table,
+                               method="KMtoIPD",
+                               kmtoipd_scenario="no_marks")
+
+# Scenario B: with marks
+rec3b <- reconstruct_ipd_twoarm(digi, res1$risk_table,
+                               method="KMtoIPD",
+                               kmtoipd_scenario="with_marks")
 
 
 sanity_plot_overlay(
-  truth_ipd = res3$ipd,
+  truth_ipd = res1$ipd,
   digi_dt = digi$data,
-  rec_list = list(rec1 = rec1, rec2 = rec2, rec3 = rec3),
-  rec_names = c("IPDfromKM", "kmdata", "KMtoIPD"),
-  curve_map = c(Control = 1, Treatment = 2),
-  out_file = out_png
+  rec_list = list(rec1 = rec1, rec2 = rec2, rec3a = rec3a, rec3b = rec3b),
+  rec_names = c("IPDfromKM", "kmdata::ipd", "KMtoIPD_useMarks", "KMtoIPD_noMarks"),
+  curve_map = c(Control = 1, Treatment = 2),  # 如果你发现反了就 swap
+  out_file = file.path(out_dir_demo, "overlay.png")
 )
 
-tau <- res3$totals$tau_study_end
+
+(tau <- res1$totals$tau_study_end)
 curve_map <- c(Control = 1, Treatment = 2)
+
+m1 <- evaluate_one_method(res1$ipd, digi$data, rec1$ipd, res1$risk_table, tau = tau, curve_map = curve_map, do_rmst = FALSE)
+m2 <- evaluate_one_method(res1$ipd, digi$data, rec2$ipd, res1$risk_table, tau = tau, curve_map = curve_map, do_rmst = FALSE)
+m3a <- evaluate_one_method(res1$ipd, digi$data, rec3a$ipd, res1$risk_table, tau = tau, curve_map = curve_map, do_rmst = FALSE)
+m3b <- evaluate_one_method(res1$ipd, digi$data, rec3b$ipd, res1$risk_table, tau = tau, curve_map = curve_map, do_rmst = FALSE)
+
+as.data.frame(
+  method = c("IPDfromKM", "kmdata::ipd", "KMtoIPD_useMarks", "KMtoIPD_noMarks"),
+  rbind(m1, m2, m3a, m3b)
+)
+
+
+
+
+
 
 
 # ---- 画图 ----

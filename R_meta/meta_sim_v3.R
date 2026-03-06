@@ -35,7 +35,7 @@
   invisible(TRUE)
 }
 
-.require_pkgs(c("survival", "data.table", "metafor", "ggplot2", "IPDfromKM"))
+.require_pkgs(c("survival", "data.table", "metafor", "ggplot2", "IPDfromKM", "dplyr", "tidyr", "scales"))
 
 suppressPackageStartupMessages({
   library(survival)
@@ -318,7 +318,7 @@ estimate_logHR_cox <- function(ipd){
 
 # ---- 2) Estimation + digitization + reconstruction ----
 
-# 多打点
+# Number of points: 100
 digitize_km_numeric <- function(
     ipd_true,
     risk_table,           # 风险表（包含trisk时间点）
@@ -383,10 +383,10 @@ digitize_km_numeric <- function(
 }
 
 
-# 修改：数字化直接在风险表时间点上提取KM值，缺点是打点少
+# ---- Numeric at risk table ----
 # digitize_km_numeric <- function(
 #     ipd_true,
-#     risk_table,          # 新增参数：风险表（包含时间点）
+#     risk_table,
 #     sd_S = 0.1
 # ){
 #   stopifnot(is.data.frame(ipd_true), all(c("time","status","arm") %in% names(ipd_true)))
@@ -439,6 +439,7 @@ digitize_km_numeric <- function(
 #     times = times
 #   )
 # }
+# ----
 
 # Two-arm reconstruction using IPDfromKM only
 reconstruct_ipd_IPDfromKM <- function(

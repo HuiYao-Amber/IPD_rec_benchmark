@@ -7,11 +7,12 @@ library(tidyr)
 library(ggplot2)
 
 # 将 data.table 转为 data.frame 方便 dplyr 操作（也可直接用 data.table）
-methods_df <- as.data.frame(sim2$res_methods_long)
+methods_df <- as.data.frame(sim$res_methods_long)
 
 # 按场景和方法分组汇总
 perf_summary <- methods_df %>%
-  group_by(scenario_id, p_miss, tau_label, tau_logHR, n_per_arm, K, method) %>%
+  filter(ok == TRUE & is.finite(logHR_hat) & is.finite(se_hat)) %>%  # 只考虑 meta 分析成功的重复
+  group_by(scenario_id, p_miss, tau_label, tau_logHR, n_per_arm, K, method, censoring) %>%
   summarise(
     n_rep = n(),                              # 重复次数
     fail_rate = mean(!ok, na.rm = TRUE),      # meta分析失败的比例（如收敛失败）
@@ -19,7 +20,7 @@ perf_summary <- methods_df %>%
     bias = mean(err, na.rm = TRUE),            # 偏差
     abs_bias = mean(abs(err), na.rm = TRUE),   # 绝对偏差
     rmse = sqrt(mean(err^2, na.rm = TRUE)),    # RMSE
-    coverage = mean(cover, na.rm = TRUE),      # 覆盖概率
+    # coverage = mean(cover, na.rm = TRUE),      # 覆盖概率
     .groups = "drop"
   )
 
@@ -27,25 +28,25 @@ perf_summary <- methods_df %>%
 print(perf_summary, n=60)
 
 perf_summary %>%
-  group_by(method) %>%
-  summarise(mean_bias = mean(bias), mean_rmse = mean(rmse), mean_coverage = mean(coverage), mean_k_used = mean(mean_k_used))
+  group_by(method,) %>%
+  summarise(mean_bias = mean(bias), mean_rmse = mean(rmse), mean_k_used = mean(mean_k_used))
 
 perf_summary %>%
-  group_by(method, p_miss) %>%
-  summarise(mean_bias = mean(bias), mean_rmse = mean(rmse), mean_coverage = mean(coverage), mean_k_used = mean(mean_k_used))
+  group_by(method, p_miss, censoring, tau_logHR) %>%
+  summarise(mean_bias = mean(bias), mean_rmse = mean(rmse), mean_k_used = mean(mean_k_used))
 
 perf_summary %>%
   group_by( tau_logHR) %>%
-  summarise(mean_bias = mean(bias), mean_rmse = mean(rmse), mean_coverage = mean(coverage), mean_k_used = mean(mean_k_used))
+  summarise(mean_bias = mean(bias), mean_rmse = mean(rmse), mean_k_used = mean(mean_k_used))
 
 
 # 重建成功的概率
-studies_df <- as.data.frame(sim2$res_studies_long)
+studies_df <- as.data.frame(sim$res_studies_long)
 
 # 计算每个场景下，缺失试验的重建成功率
 recon_success <- studies_df %>%
   filter(is_missing == TRUE) %>%               # 只考虑缺失的试验
-  group_by(p_miss, tau_label, n_label, K, n_per_arm) %>%
+  group_by(p_miss, tau_label, n_label,  censoring) %>%
   summarise(
     n_missing = n(),                            # 缺失试验总数
     n_recon_ok = sum(recon_ok, na.rm = TRUE),   # 重建成功的数量
@@ -53,14 +54,14 @@ recon_success <- studies_df %>%
     .groups = "drop"
   )
 
-print(recon_success)
+print(recon_success, n=100)
 
 
 
 
 # 为了方便绘图，将 p_miss 转为数值因子，tau_label 作为分面
 perf_plot <- perf_summary %>%
-  filter(method != "Pooled_IPD") %>%   # 金标准作为参考线，可以不画或单独画
+  filter(method != "Pooled_IPD", censoring == "random") %>%   # 金标准作为参考线，可以不画或单独画
   mutate(p_miss = as.numeric(p_miss))
 
 # 偏差图
@@ -73,7 +74,7 @@ ggplot(perf_plot, aes(x = p_miss, y = bias, color = method, group = method)) +
     x = "Proportion of missing HR",
     y = "Bias (log HR scale)",
     color = "Method",
-    title = "Bias of meta-analysis methods under different missing proportions"
+    title = "Bias of meta-analysis methods under different missing proportions - Random"
   ) +
   theme_bw()
 
@@ -86,15 +87,15 @@ ggplot(perf_plot, aes(x = p_miss, y = rmse, color = method, group = method)) +
     x = "Proportion of missing HR",
     y = "RMSE (log HR scale)",
     color = "Method",
-    title = "RMSE of meta-analysis methods"
+    title = "RMSE of meta-analysis methods - Random"
   ) +
   theme_bw()
 
 # 方差图
 # 从 res_methods_long 重新计算每个场景各方法的平均标准误
-perf_summary_var <- sim3$res_methods_long %>%
+perf_summary_var <- sim$res_methods_long %>%
   as.data.frame() %>%
-  group_by(scenario_id, p_miss, tau_label, n_label, method) %>%
+  group_by(censoring, scenario_id, p_miss, tau_label, n_label, method) %>%
   summarise(
     mean_se = mean(se_hat, na.rm = TRUE),
     mean_var = mean(se_hat^2, na.rm = TRUE),
@@ -102,6 +103,7 @@ perf_summary_var <- sim3$res_methods_long %>%
   )
 # 准备绘图数据（可包含 Pooled_IPD 作为参考）
 plot_data_var <- perf_summary_var %>%
+  filter(censoring == "random") %>%  # 金标准作为参考线，可以不画或单独画
   mutate(p_miss = as.numeric(p_miss))
 
 
@@ -109,11 +111,11 @@ plot_data_var <- perf_summary_var %>%
 ggplot(plot_data_var, aes(x = p_miss, y = mean_var, color = method, group = method)) +
   geom_line() +
   geom_point(size = 2) +
-  facet_wrap(~ tau_label, labeller = labeller(tau_label = c(low="Low",  high="High",middle="Middle"))) +
+  facet_wrap(~ tau_label, labeller = labeller(tau_label = c(low="Low",middle="Middle",high="High"))) +
   labs(
     x = "Proportion of missing HR",
     y = "Mean variance (log HR scale)",
     color = "Method",
-    title = "Precision of meta-analysis methods (smaller SE = better precision)"
+    title = "Precision of meta-analysis methods - Random"
   ) +
   theme_bw()

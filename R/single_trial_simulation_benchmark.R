@@ -415,10 +415,11 @@ run_single_trial_benchmark <- function(
 # Minimal test example
 # --------------------------
 
-# 3) scenario library (build once)
+# scenario library (build once)
 lib <- make_scenario_library(mean_time = 10)
 
-# 4) design table: define your experimental settings
+# Example 1 ----
+
 design <- data.frame(
   scenario_id = c("W_shape0p6_HR085", "W_shape0p6_HR067", "W_shape0p6_HR085", "W_shape0p6_HR067"),
   censoring = c("random","random","back","back"),
@@ -431,8 +432,7 @@ design <- data.frame(
 out_dir <- here::here("test", "0608567_2cen_100_test")
 
 
-# 5) run small benchmark
-bench4 <- run_single_trial_benchmark(
+bench <- run_single_trial_benchmark(
   design = design,
   n_rep = 10,
   scenario_lib = lib,
@@ -460,6 +460,7 @@ write.csv(bench2$results, file = file.path(here::here("test"), "results.csv"), r
 #   arrange(censoring)
 
 
+# Example 2 ----
 
 design2 <- data.frame(
   scenario_id = c("W_shape0p6_HR067", "W_shape0p6_HR067", "W_shape0p6_HR067", "W_shape0p6_HR067", "W_shape0p6_HR067"),
@@ -473,7 +474,6 @@ design2 <- data.frame(
 out_dir2 <- here::here("test", "numric_rep10_HR067_5cen")
 
 
-# 5) run small benchmark
 bench2 <- run_single_trial_benchmark(
   design = design2,
   n_rep = 100,
@@ -489,6 +489,7 @@ bench2 <- run_single_trial_benchmark(
 write.csv(bench2$results, file = file.path(here::here("test"), "single_trial_06067_5cen_300.csv"), row.names = FALSE)
 
 
+# Example 3 ----
 
 design3 <- data.frame(
   scenario_id = c("W_shape0p6_HR085", "W_shape0p6_HR085", "W_shape0p6_HR085", "W_shape0p6_HR085", "W_shape0p6_HR085"),
@@ -502,13 +503,12 @@ design3 <- data.frame(
 out_dir3 <- here::here("test", "numric_rep100_HR085_5cen")
 
 
-# 5) run small benchmark
 bench3 <- run_single_trial_benchmark(
   design = design3,
   n_rep = 100,
   scenario_lib = lib,
   base_seed = 2,
-  out_dir = out_dir2,
+  out_dir = out_dir3,
   keep_files = FALSE,
   verbose = TRUE,
   digitize_mode = "keep_censor_marks",
@@ -517,6 +517,8 @@ bench3 <- run_single_trial_benchmark(
 
 write.csv(bench3$results, file = file.path(here::here("test"), "single_trial_06085_5cen_100.csv"), row.names = FALSE)
 
+
+# Example 4 ----
 
 design4 <- data.frame(
   scenario_id = c("W_shape2p0_HR085", "W_shape2p0_HR085", "W_shape2p0_HR085", "W_shape2p0_HR085", "W_shape2p0_HR085"),
@@ -529,8 +531,6 @@ design4 <- data.frame(
 
 out_dir4 <- here::here("test", "numric_rep100_20HR085_5cen")
 
-
-# 5) run small benchmark
 bench4 <- run_single_trial_benchmark(
   design = design4,
   n_rep = 100,
@@ -546,7 +546,7 @@ bench4 <- run_single_trial_benchmark(
 write.csv(bench4$results, file = file.path(here::here("test"), "single_trial_20085_5cen_100.csv"), row.names = FALSE)
 
 
-
+# Example 5 ----
 
 design5 <- data.frame(
   scenario_id = c("W_shape0p6_HR067", "W_shape0p6_HR067", "W_shape0p6_HR067", "W_shape0p6_HR067", "W_shape0p6_HR067"),
@@ -578,13 +578,10 @@ write.csv(bench5$results, file = file.path(here::here("test"), "single_trial_060
 
 
 
-# 6) inspect outputs
-head(bench5$results)
-bench5$results[, c("reconstruct_error",
-                   "rmse_mean","km_rmse_mean","cox_logHR_diff","rmst_diff")]
-bench2$errors
+# inspect outputs ----
 
-res <- bench2$results
+
+res <- bench5$results
 
 # mark failures
 res$ok <- is.na(res$reconstruct_error) | !nzchar(res$reconstruct_error)
@@ -627,7 +624,7 @@ bench5$results %>%
   arrange(censoring)
 
 
-bench2$results %>%
+bench5$results %>%
   dplyr::group_by(censoring, method) %>%
   dplyr::summarise(
     n = dplyr::n(),
@@ -646,8 +643,3 @@ plot(sort(bench2$results$km_rmse_mean))
 plot(sort(bench2$results$n_points_used))
 plot(sort(bench2$results$nrisk_maxabs_treatment))
 summary(bench2$results$rmse_mean)
-
-# 7) save results if you want
-write.csv(bench2$results, file = file.path(here::here("test"), "single_trial_06067_5cen_50.csv"), row.names = FALSE)
-
-

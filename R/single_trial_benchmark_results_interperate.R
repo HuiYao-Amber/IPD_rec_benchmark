@@ -4,12 +4,12 @@ library(tidyr)
 # write.csv(bench5$results, file = file.path(here::here("test"), "single_trial_06067_5cen_500.csv"), row.names = FALSE)
 # res <- read.csv(file.path(here::here("test"), "single_trial_06067_5cen_500.csv"))
 
-res <- bench5$results
 
 dim(res)
+colnames(res)
 
 
-#检查稳定性
+# stability
 res %>%
   mutate(
     ok_dgm = is.na(dgm_error),
@@ -23,6 +23,7 @@ res %>%
     .groups = "drop"
   ) %>%
   arrange(censoring)
+
 
 res %>%
   mutate(
@@ -55,7 +56,7 @@ res %>%
   arrange(censoring, method,rec_fail)
 
 
-# 检查删失数量
+# censoring
 res %>%
   group_by(censoring) %>%
   summarise(
@@ -67,7 +68,7 @@ res %>%
   arrange(censoring)
 
 
-# km_rmse_mean 的分布（只看成功重建的）
+# km_rmse_mean
 res_ok <- res %>%
   filter(is.na(reconstruct_error), is.finite(km_rmse_mean))
 
@@ -85,24 +86,21 @@ res_ok %>%
 ggplot(res_ok, aes(
   x = factor(censoring, levels = c("random", "exp", "front", "back","informative")),
   y = km_rmse_mean,
-  fill = factor(method, levels = c( "KMtoIPD","IPDfromKM", "kmdata"))
+  fill = factor(method, levels = c( "kmdata","IPDfromKM", "KMtoIPD_no_marks","KMtoIPD_with_marks"))
 )) +
   geom_boxplot(outlier.alpha = 0.2) +
   coord_cartesian(ylim = c(0, 0.1)) +
   theme_bw() +
   theme(legend.position = "bottom")+
   labs(
-    title = "KM RMSE (reconstructed vs true) across censoring types",
-    x = "Censoring mechanism",
+    title = "KM RMSE across censoring types - Weibull shape=0.6",
+    x = "Censoring",
     y = "KM RMSE (mean of arms)"
   )
-
-
-# 可选保存
 # ggsave("km_rmse_by_censoring.png", p, width = 8, height = 5, dpi = 200)
 
 
-# cox_logHR_diff 的分布（只看成功重建的）
+# cox_logHR_diff
 res_ok %>%
   group_by(censoring, method) %>%
   summarise(
@@ -115,21 +113,21 @@ res_ok %>%
 ggplot(res_ok, aes(
   x = factor(censoring, levels = c("random", "exp", "front", "back","informative")),
   y = cox_logHR_diff,
-  fill = factor(method, levels = c( "KMtoIPD","IPDfromKM", "kmdata"))
+  fill = factor(method, levels = c( "kmdata","IPDfromKM", "KMtoIPD_no_marks","KMtoIPD_with_marks"))
 )) +
   geom_boxplot(outlier.alpha = 0.2) +
   coord_cartesian(ylim = c(-0.3, 0.3)) +
   theme_bw() +
   theme(legend.position = "bottom")+
   labs(
-    title = "Cox logHR difference (reconstructed - true)",
-    x = "Censoring mechanism",
+    title = "Cox logHR difference (reconstructed - true) - Weibull shape=0.6",
+    x = "Censoring",
     y = "Δ logHR"
   )
 
 
 
-# rmst_diff 的分布（只看成功重建的）
+# rmst_diff
 res_ok %>%
   group_by(censoring, method) %>%
   summarise(
@@ -144,14 +142,14 @@ res_ok %>%
 ggplot(res_ok, aes(
   x = factor(censoring, levels = c("random", "exp", "front", "back","informative")),
   y = rmst_diff,
-  fill = factor(method, levels = c( "KMtoIPD","IPDfromKM", "kmdata"))
+  fill = factor(method, levels = c( "kmdata","IPDfromKM", "KMtoIPD_no_marks","KMtoIPD_with_marks"))
 )) +
   geom_boxplot(outlier.alpha = 0.2) +
   coord_cartesian(ylim = c(-3, 3)) +
   theme_bw() +
   theme(legend.position = "bottom")+
   labs(
-    title = "Restricted Mean Survival Time",
+    title = "Restricted Mean Survival Time - Weibull shape=0.6",
     x = "Censoring mechanism",
     y = "Δ rmst"
   )

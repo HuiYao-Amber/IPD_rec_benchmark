@@ -19,7 +19,7 @@ suppressPackageStartupMessages({
   library(kmdata)
 })
 
-
+# -------------------------------------------------------------------------
 
 `%||%` <- function(x, y) if (!is.null(x)) x else y
 
@@ -145,16 +145,89 @@ make_censor_uniforms <- function(n_control, n_treatment){
   )
 }
 
+# -------------------------
+# Helper: canonicalize names (backward compatible)
+# -------------------------
+canonicalize_censoring <- function(censoring){
+  # allow aliases if you prefer more explicit names later
+  switch(
+    censoring,
+    uniform_NI   = "random",
+    exp_admin_NI = "exp",
+    front_NI     = "front",
+    back_NI      = "back",
+    exp_admin_I  = "exp_I",
+    censoring
+  )
+}
+
+# -------------------------
+# Helper: risk score from latent T (makes censoring informative without changing event DGM)
+#   small T => large risk => earlier censor (by default)
+# -------------------------
+risk_score_from_T <- function(T){
+  n <- length(T)
+  if (n <= 1) return(rep(0, n))
+  q <- rank(T, ties.method = "average") / (n + 1)   # in (0,1)
+  z <- stats::qnorm(1 - q)                          # small T -> large z
+  z <- as.numeric(scale(z))
+  z[!is.finite(z)] <- 0
+  z
+}
+
+# -------------------------
+# Helper: defaults for censoring parameters (extreme on purpose)
+#   You can override by passing censor_par=list(...)
+# -------------------------
+default_censor_par <- function(censoring, target_censoring){
+  # clamp for informative scaling to avoid insane multipliers
+  clamp_default <- c(0.05, 20)
+
+  switch(
+    censoring,
+    random = list(),
+    exp    = list(p0 = target_censoring),  # keeps your current exp behavior
+    front  = list(a = 0.30, b = 4.00, p = 2.0),
+    back   = list(a = 4.00, b = 0.30, p = 2.0),
+
+    # legacy informative: keep your old mixture definition
+    informative = list(p_inf = target_censoring),
+
+    # NEW informative mechanisms (same base shapes as NI, but depend on T)
+    front_I = list(a = 0.30, b = 4.00, p = 2.0, gamma = 1.5, clamp = clamp_default),
+    back_I  = list(a = 4.00, b = 0.30, p = 2.0, gamma = 1.5, clamp = clamp_default),
+    exp_I   = list(p0 = target_censoring, gamma = 1.5),
+
+    stop("Unknown censoring: ", censoring)
+  )
+}
+
+# -------------------------
+# Helper: merge defaults with user-supplied censor_par (user wins)
+# -------------------------
+merge_par <- function(def, user){
+  if (is.null(user)) return(def)
+  out <- def
+  for (nm in names(user)) out[[nm]] <- user[[nm]]
+  out
+}
+
+
+
 # Generate censoring times C given tau and fixed random streams
 make_censor_times <- function(
     tau,
-    censoring = c("random","informative","exp","front","back"),
+    censoring = c("random","informative","exp","front","back","front_I","back_I","exp_I",
+                  "uniform_NI","exp_admin_NI","front_NI","back_NI","exp_admin_I"),
     target_censoring = 0.25,
     T_control,
     T_treat,
-    U
+    U,
+    censor_par = NULL
 ){
   censoring <- match.arg(censoring)
+  censoring <- canonicalize_censoring(censoring)
+
   stopifnot(is.finite(tau), tau > 0)
   stopifnot(target_censoring >= 0, target_censoring <= 0.95)
 
@@ -162,32 +235,89 @@ make_censor_times <- function(
   tauA <- rep(tau, length(T_control))
   tauB <- rep(tau, length(T_treat))
 
+  # default params (extreme), then override
+  par <- merge_par(default_censor_par(censoring, target_censoring), censor_par)
+
+  # base NI generators (extreme Beta+Power; exp as in your original)
+  gen_front <- function(Uu, tau_vec, a, b, p){
+    B <- stats::qbeta(Uu, a, b)
+    (B^p) * tau_vec
+  }
+  gen_back <- function(Uu, tau_vec, a, b, p){
+    B <- stats::qbeta(Uu, a, b)
+    (1 - (1 - B)^p) * tau_vec
+  }
+  gen_exp <- function(Uu, tau_scalar, p0){
+    p0 <- max(0, min(0.95, p0))
+    lambda <- -log(1 - p0) / max(1e-9, tau_scalar)
+    -log(1 - Uu) / lambda
+  }
+
+  # informative scaling based on latent T (within-arm)
+  scale_informative <- function(C0, T_latent, gamma, clamp){
+    z <- risk_score_from_T(T_latent)  # small T -> big z
+    sf <- exp(-gamma * z)             # high risk -> smaller C
+    if (!is.null(clamp) && length(clamp) == 2) {
+      sf <- pmin(pmax(sf, clamp[1]), clamp[2])
+    }
+    C1 <- C0 * sf
+    C1
+  }
+
+  # ---- main switch ----
   if (censoring == "random") {
     # Uniform(0, tau) LTFU clock
     C_control <- U$U_C_control * tauA
     C_treat   <- U$U_C_treat   * tauB
 
   } else if (censoring == "exp") {
-    # Exponential LTFU clock with P(C <= tau) approximately target_censoring
-    p0 <- max(0, min(0.95, target_censoring))
-    lambda <- -log(1 - p0) / max(1e-9, tau)
-    C_control <- -log(1 - U$U_C_control) / lambda
-    C_treat   <- -log(1 - U$U_C_treat)   / lambda
+    # Exponential LTFU clock (unbounded); admin handled in realize_ipd via pmin(..., tau)
+    C_control <- gen_exp(U$U_C_control, tau, par$p0 %||% target_censoring)
+    C_treat   <- gen_exp(U$U_C_treat,   tau, par$p0 %||% target_censoring)
 
   } else if (censoring == "front") {
-    # Early censoring: Beta(a<1, b>1) concentrated near 0
-    C_control <- stats::qbeta(U$U_C_control, 0.7, 2.0) * tauA
-    C_treat   <- stats::qbeta(U$U_C_treat,   0.7, 2.0) * tauB
+    # Non-informative front-loaded (extreme): τ * Beta(a,b)^p
+    C_control <- gen_front(U$U_C_control, tauA, par$a, par$b, par$p)
+    C_treat   <- gen_front(U$U_C_treat,   tauB, par$a, par$b, par$p)
 
   } else if (censoring == "back") {
-    # Late censoring: Beta(a>1, b<1) concentrated near 1
-    C_control <- stats::qbeta(U$U_C_control, 2.0, 0.7) * tauA
-    C_treat   <- stats::qbeta(U$U_C_treat,   2.0, 0.7) * tauB
+    # Non-informative back-loaded (extreme): τ * (1-(1-B)^p), B~Beta(a,b)
+    C_control <- gen_back(U$U_C_control, tauA, par$a, par$b, par$p)
+    C_treat   <- gen_back(U$U_C_treat,   tauB, par$a, par$b, par$p)
+
+  } else if (censoring == "front_I") {
+    # Informative front: base front clock scaled by risk(T)
+    C0A <- gen_front(U$U_C_control, tauA, par$a, par$b, par$p)
+    C0B <- gen_front(U$U_C_treat,   tauB, par$a, par$b, par$p)
+
+    C_control <- scale_informative(C0A, T_control, par$gamma, par$clamp)
+    C_treat   <- scale_informative(C0B, T_treat,   par$gamma, par$clamp)
+
+  } else if (censoring == "back_I") {
+    # Informative back: base back clock scaled by risk(T)
+    C0A <- gen_back(U$U_C_control, tauA, par$a, par$b, par$p)
+    C0B <- gen_back(U$U_C_treat,   tauB, par$a, par$b, par$p)
+
+    C_control <- scale_informative(C0A, T_control, par$gamma, par$clamp)
+    C_treat   <- scale_informative(C0B, T_treat,   par$gamma, par$clamp)
+
+  } else if (censoring == "exp_I") {
+    # Informative exp: exp clock with subject-specific rate depending on risk(T)
+    zA <- risk_score_from_T(T_control)
+    zB <- risk_score_from_T(T_treat)
+
+    p0 <- par$p0 %||% target_censoring
+    p0 <- max(0, min(0.95, p0))
+    lambda0 <- -log(1 - p0) / max(1e-9, tau)       # baseline rate as before
+    rateA <- lambda0 * exp(par$gamma * zA)         # high risk -> larger rate -> earlier C
+    rateB <- lambda0 * exp(par$gamma * zB)
+
+    C_control <- -log(1 - U$U_C_control) / rateA
+    C_treat   <- -log(1 - U$U_C_treat)   / rateB
 
   } else {
-    # Informative censoring:
-    # With probability p_inf, censor occurs uniformly BEFORE the (possibly administratively truncated) event time.
-    p_inf <- max(0, min(0.95, target_censoring))
+    # legacy informative (keep exactly your old behavior)
+    p_inf <- max(0, min(0.95, par$p_inf %||% target_censoring))
     TiA <- pmin(T_control, tauA)
     TiB <- pmin(T_treat,   tauB)
 
@@ -195,8 +325,64 @@ make_censor_times <- function(
     C_treat   <- ifelse(U$U_inf_sel_treat   < p_inf, U$U_inf_time_treat   * TiB, Inf)
   }
 
-  list(C_control = C_control, C_treat = C_treat, tauA = tauA, tauB = tauB)
+  list(
+    C_control = C_control, C_treat = C_treat, tauA = tauA, tauB = tauB,
+    censoring = censoring,
+    censor_par = par
+  )
 }
+
+# make_censor_times <- function(
+#     tau,
+#     censoring = c("random","informative","exp","front","back"),
+#     target_censoring = 0.25,
+#     T_control,
+#     T_treat,
+#     U
+# ){
+#   censoring <- match.arg(censoring)
+#   stopifnot(is.finite(tau), tau > 0)
+#   stopifnot(target_censoring >= 0, target_censoring <= 0.95)
+#
+#   # No staggered entry: everyone has the same administrative follow-up cap
+#   tauA <- rep(tau, length(T_control))
+#   tauB <- rep(tau, length(T_treat))
+#
+#   if (censoring == "random") {
+#     # Uniform(0, tau) LTFU clock
+#     C_control <- U$U_C_control * tauA
+#     C_treat   <- U$U_C_treat   * tauB
+#
+#   } else if (censoring == "exp") {
+#     # Exponential LTFU clock with P(C <= tau) approximately target_censoring
+#     p0 <- max(0, min(0.95, target_censoring))
+#     lambda <- -log(1 - p0) / max(1e-9, tau)
+#     C_control <- -log(1 - U$U_C_control) / lambda
+#     C_treat   <- -log(1 - U$U_C_treat)   / lambda
+#
+#   } else if (censoring == "front") {
+#     # Early censoring: Beta(a<1, b>1) concentrated near 0
+#     C_control <- stats::qbeta(U$U_C_control, 0.7, 2.0) * tauA
+#     C_treat   <- stats::qbeta(U$U_C_treat,   0.7, 2.0) * tauB
+#
+#   } else if (censoring == "back") {
+#     # Late censoring: Beta(a>1, b<1) concentrated near 1
+#     C_control <- stats::qbeta(U$U_C_control, 2.0, 0.7) * tauA
+#     C_treat   <- stats::qbeta(U$U_C_treat,   2.0, 0.7) * tauB
+#
+#   } else {
+#     # Informative censoring:
+#     # With probability p_inf, censor occurs uniformly BEFORE the (possibly administratively truncated) event time.
+#     p_inf <- max(0, min(0.95, target_censoring))
+#     TiA <- pmin(T_control, tauA)
+#     TiB <- pmin(T_treat,   tauB)
+#
+#     C_control <- ifelse(U$U_inf_sel_control < p_inf, U$U_inf_time_control * TiA, Inf)
+#     C_treat   <- ifelse(U$U_inf_sel_treat   < p_inf, U$U_inf_time_treat   * TiB, Inf)
+#   }
+#
+#   list(C_control = C_control, C_treat = C_treat, tauA = tauA, tauB = tauB)
+# }
 
 # Realize observed IPD given latent T, censor times C, and admin tau
 realize_ipd <- function(
@@ -205,7 +391,8 @@ realize_ipd <- function(
     target_censoring,
     T_control,
     T_treat,
-    U
+    U,
+    censor_par = NULL
 ){
   CC <- make_censor_times(
     tau = tau,
@@ -213,7 +400,8 @@ realize_ipd <- function(
     target_censoring = target_censoring,
     T_control = T_control,
     T_treat = T_treat,
-    U = U
+    U = U,
+    censor_par = censor_par
   )
 
   C_control <- CC$C_control
@@ -243,9 +431,58 @@ realize_ipd <- function(
     C_control = C_control,
     C_treat = C_treat,
     tauA = tauA,
-    tauB = tauB
+    tauB = tauB,
+    censoring = CC$censoring,
+    censor_par = CC$censor_par
   )
 }
+# realize_ipd <- function(
+#     tau,
+#     censoring,
+#     target_censoring,
+#     T_control,
+#     T_treat,
+#     U
+# ){
+#   CC <- make_censor_times(
+#     tau = tau,
+#     censoring = censoring,
+#     target_censoring = target_censoring,
+#     T_control = T_control,
+#     T_treat = T_treat,
+#     U = U
+#   )
+#
+#   C_control <- CC$C_control
+#   C_treat   <- CC$C_treat
+#   tauA <- CC$tauA
+#   tauB <- CC$tauB
+#
+#   # Observed time and status
+#   X_control <- pmin(T_control, C_control, tauA)
+#   D_control <- as.integer(T_control <= C_control & T_control <= tauA)
+#
+#   X_treat <- pmin(T_treat, C_treat, tauB)
+#   D_treat <- as.integer(T_treat <= C_treat & T_treat <= tauB)
+#
+#   ipd <- data.frame(
+#     time   = c(X_control, X_treat),
+#     status = c(D_control, D_treat),
+#     arm    = c(rep("Control", length(X_control)), rep("Treatment", length(X_treat))),
+#     stringsAsFactors = FALSE
+#   )
+#   ipd <- ipd[order(ipd$arm, ipd$time), , drop = FALSE]
+#
+#   list(
+#     ipd = ipd,
+#     censor_prop = mean(ipd$status == 0),
+#     n_events = sum(ipd$status == 1),
+#     C_control = C_control,
+#     C_treat = C_treat,
+#     tauA = tauA,
+#     tauB = tauB
+#   )
+# }
 
 # Calibrate tau to achieve target censor proportion (deterministic calibration)
 calibrate_tau <- function(
@@ -255,21 +492,26 @@ calibrate_tau <- function(
     T_control,
     T_treat,
     U,
+    censor_par = NULL,
     tol = 1e-4,
     tau_cap = 1e5
 ){
-  censoring <- match.arg(censoring, c("random","informative","exp","front","back"))
+  censoring <- match.arg(censoring,
+                         c("random","informative","exp","front","back","front_I","back_I","exp_I",
+                           "uniform_NI","exp_admin_NI","front_NI","back_NI","exp_admin_I"))
+  censoring <- canonicalize_censoring(censoring)
+
   stopifnot(target_censoring >= 0, target_censoring <= 0.95)
 
-  # Informative: treat target_censoring as p_inf, and choose tau long enough so admin censor is negligible.
+  # Keep legacy informative behavior unchanged (treat target as p_inf; make admin negligible)
   if (censoring == "informative") {
     base <- (scn$mean_time %||% 10)
     tau_star <- max(5, 3 * base)
 
-    # Inflate tau until overall censor proportion is close to p_inf from above
     tol_inf <- 0.01
     for (k in 1:12) {
-      cp <- realize_ipd(tau_star, censoring, target_censoring, T_control, T_treat, U)$censor_prop
+      cp <- realize_ipd(tau_star, censoring, target_censoring, T_control, T_treat, U,
+                        censor_par = censor_par)$censor_prop
       if (cp - target_censoring <= tol_inf) break
       tau_star <- min(tau_star * 1.5, tau_cap)
     }
@@ -278,7 +520,8 @@ calibrate_tau <- function(
 
   # Otherwise: root solve for tau so censor_prop(tau) - target = 0
   f_root <- function(tau){
-    realize_ipd(tau, censoring, target_censoring, T_control, T_treat, U)$censor_prop - target_censoring
+    realize_ipd(tau, censoring, target_censoring, T_control, T_treat, U,
+                censor_par = censor_par)$censor_prop - target_censoring
   }
 
   tau_lo <- 1e-6
@@ -305,6 +548,63 @@ calibrate_tau <- function(
     min(tau_hi, tau_cap)
   }
 }
+# calibrate_tau <- function(
+#     censoring,
+#     target_censoring,
+#     scn,
+#     T_control,
+#     T_treat,
+#     U,
+#     tol = 1e-4,
+#     tau_cap = 1e5
+# ){
+#   censoring <- match.arg(censoring, c("random","informative","exp","front","back"))
+#   stopifnot(target_censoring >= 0, target_censoring <= 0.95)
+#
+#   # Informative: treat target_censoring as p_inf, and choose tau long enough so admin censor is negligible.
+#   if (censoring == "informative") {
+#     base <- (scn$mean_time %||% 10)
+#     tau_star <- max(5, 3 * base)
+#
+#     # Inflate tau until overall censor proportion is close to p_inf from above
+#     tol_inf <- 0.01
+#     for (k in 1:12) {
+#       cp <- realize_ipd(tau_star, censoring, target_censoring, T_control, T_treat, U)$censor_prop
+#       if (cp - target_censoring <= tol_inf) break
+#       tau_star <- min(tau_star * 1.5, tau_cap)
+#     }
+#     return(tau_star)
+#   }
+#
+#   # Otherwise: root solve for tau so censor_prop(tau) - target = 0
+#   f_root <- function(tau){
+#     realize_ipd(tau, censoring, target_censoring, T_control, T_treat, U)$censor_prop - target_censoring
+#   }
+#
+#   tau_lo <- 1e-6
+#   tau_hi <- max(5, (scn$mean_time %||% 10))
+#
+#   f_lo <- f_root(tau_lo)
+#   f_hi <- f_root(tau_hi)
+#
+#   iter <- 0L
+#   while (is.finite(f_lo) && is.finite(f_hi) && f_lo * f_hi > 0 && iter < 25L) {
+#     tau_hi <- min(tau_hi * 1.8, tau_cap)
+#     f_hi <- f_root(tau_hi)
+#     iter <- iter + 1L
+#     if (tau_hi >= tau_cap) break
+#   }
+#
+#   if (is.finite(f_lo) && is.finite(f_hi) && f_lo * f_hi <= 0) {
+#     stats::uniroot(f_root, interval = c(tau_lo, tau_hi), tol = tol)$root
+#   } else {
+#     warning(sprintf(
+#       "Could not bracket tau for target_censoring=%.3f (censoring=%s); using tau=%.3f.",
+#       target_censoring, censoring, tau_hi
+#     ))
+#     min(tau_hi, tau_cap)
+#   }
+# }
 
 #==============================================================#
 # Layer 2: Derived outputs (axis, risk table, summaries)
@@ -480,12 +780,20 @@ simulate_trial <- function(
     scenario_lib = NULL,
     n_control = 250,
     n_treatment = 250,
-    censoring = c("random","informative","exp","front","back"),
+
+    # expanded censoring menu (backward compatible)
+    censoring = c("random","informative","exp","front","back",
+                  "front_I","back_I","exp_I",
+                  "uniform_NI","exp_admin_NI","front_NI","back_NI","exp_admin_I"),
     target_censoring = 0.30,
+
+    # NEW: pass-through censoring parameters (optional)
+    censor_par = NULL,
+
     seed = NULL,
 
     # Optional outputs
-    out_dir = NULL,   # if NULL, no disk writing
+    out_dir = NULL,
     prefix = "sim1",
     plot = c("none","km"),
     add_censor_marks = TRUE
@@ -509,7 +817,8 @@ simulate_trial <- function(
     scn = scn,
     T_control = latent$T_control,
     T_treat = latent$T_treat,
-    U = U
+    U = U,
+    censor_par = censor_par        # <- NEW
   )
 
   R <- realize_ipd(
@@ -518,7 +827,8 @@ simulate_trial <- function(
     target_censoring = target_censoring,
     T_control = latent$T_control,
     T_treat = latent$T_treat,
-    U = U
+    U = U,
+    censor_par = censor_par        # <- NEW
   )
   ipd <- R$ipd
 
@@ -531,7 +841,6 @@ simulate_trial <- function(
   km_png <- NULL
   if (plot == "km") {
     if (is.null(out_dir)) {
-      # plot to current device
       plot_km(ipd, axis, add_censor_marks = add_censor_marks, file = NULL)
     } else {
       km_png <- file.path(out_dir, paste0(prefix, "_KM_with_censor.png"))
@@ -549,14 +858,100 @@ simulate_trial <- function(
     )
   }
 
+  # NEW: return tau_star and R (contains censor clocks + censor_par)
   list(
     ipd = ipd,
     axis = axis,
     risk_table = risk_table,
     totals = totals,
-    km_png = km_png
+    km_png = km_png,
+    tau_star = tau_star,
+    censoring = censoring,
+    R = R
   )
 }
+# simulate_trial <- function(
+#     scenario_id,
+#     scenario_lib = NULL,
+#     n_control = 250,
+#     n_treatment = 250,
+#     censoring = c("random","informative","exp","front","back"),
+#     target_censoring = 0.30,
+#     seed = NULL,
+#
+#     # Optional outputs
+#     out_dir = NULL,   # if NULL, no disk writing
+#     prefix = "sim1",
+#     plot = c("none","km"),
+#     add_censor_marks = TRUE
+# ){
+#   censoring <- match.arg(censoring)
+#   plot <- match.arg(plot)
+#
+#   if (!is.null(seed)) set.seed(seed)
+#
+#   if (is.null(scenario_lib)) scenario_lib <- make_scenario_library(mean_time = 10)
+#   scn <- scenario_lib[[scenario_id]]
+#   if (is.null(scn)) stop("scenario_id not found in scenario_lib: ", scenario_id)
+#
+#   # ---- Layer 1: pure generation ----
+#   latent <- generate_latent_event_times(scn, n_control, n_treatment)
+#   U <- make_censor_uniforms(n_control, n_treatment)
+#
+#   tau_star <- calibrate_tau(
+#     censoring = censoring,
+#     target_censoring = target_censoring,
+#     scn = scn,
+#     T_control = latent$T_control,
+#     T_treat = latent$T_treat,
+#     U = U
+#   )
+#
+#   R <- realize_ipd(
+#     tau = tau_star,
+#     censoring = censoring,
+#     target_censoring = target_censoring,
+#     T_control = latent$T_control,
+#     T_treat = latent$T_treat,
+#     U = U
+#   )
+#   ipd <- R$ipd
+#
+#   # ---- Layer 2: derived outputs ----
+#   axis <- compute_pretty_axis(ipd, multiple = 8L)
+#   risk_table <- make_risk_table(ipd, axis$ticks)
+#   totals <- summarize_trial(scn, scenario_id, ipd, tau_star, axis, risk_table)
+#
+#   # ---- Layer 3: optional plot/I/O ----
+#   km_png <- NULL
+#   if (plot == "km") {
+#     if (is.null(out_dir)) {
+#       # plot to current device
+#       plot_km(ipd, axis, add_censor_marks = add_censor_marks, file = NULL)
+#     } else {
+#       km_png <- file.path(out_dir, paste0(prefix, "_KM_with_censor.png"))
+#       plot_km(ipd, axis, add_censor_marks = add_censor_marks, file = km_png)
+#     }
+#   }
+#
+#   if (!is.null(out_dir)) {
+#     write_trial_outputs(
+#       ipd = ipd,
+#       risk_table = risk_table,
+#       totals = totals,
+#       out_dir = out_dir,
+#       prefix = prefix
+#     )
+#   }
+#
+#   list(
+#     ipd = ipd,
+#     axis = axis,
+#     risk_table = risk_table,
+#     totals = totals,
+#     km_png = km_png
+#   )
+# }
 
 ###############################################################################
 # TEST EXAMPLES (copy-paste runnable)

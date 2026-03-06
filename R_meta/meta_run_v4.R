@@ -1,39 +1,37 @@
-source("R_meta/meta_sim_v3.R")
+source("R_meta/meta_sim_v4.R")
 
 
 grid <- build_scenario_grid(
-  p_miss_vec = c(0, 0.2, 0.4, 0.6, 0.8),
-  tau_levels = list(low = 0.05, middle = 0.1, high = 0.25),
+  p_miss_vec = c(0, 0.3, 0.6, 0.9),
+  tau_levels = list(middle = 0.1),
   n_levels   = list(standard = 250),
+  # [MOD] To compare censoring patterns, uncomment the next line:
+  censoring_vec = c("front"),
   K = 30
 )
 
-sim <- run_meta_simulation(grid, n_rep = 300)
-sim2 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
-sim3 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
-str(sim3)
+sim <- run_meta_simulation(grid, n_rep = 200)
+perf <- summarise_performance(sim$res_methods_long, mu_HR = 0.75)
+write.csv(sim$res_methods_long, file = "meta_benchmark_results_0226/sim_reps300_results_long.csv")
+plot_bias_rmse(perf, out_dir = "meta_benchmark_results_0226")
 
+sim2 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
 write.csv(sim2$res_methods_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004_more_points/sim_reps300_results_long.csv")
 write.csv(sim2$res_studies_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004_more_points/sim_reps300_studies_long.csv")
-
-write.csv(sim3$res_methods_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_results_long.csv")
-write.csv(sim3$res_studies_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_studies_long.csv")
-
-perf <- summarise_performance(sim$res_methods_long, mu_HR = 0.75)
-plot_bias_rmse(perf, out_dir = "R_meta/meta_sim_k30_n100_outputs")
-
 perf2 <- summarise_performance(sim2$res_methods_long, mu_HR=0.75)
 plot_bias_rmse(perf2, out_dir="R_meta")
 
+
+
+sim3 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
+str(sim3)
+write.csv(sim3$res_methods_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_results_long.csv")
+write.csv(sim3$res_studies_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_studies_long.csv")
 perf3 <- summarise_performance(sim3$res_methods_long, mu_HR=0.75)
 plot_bias_rmse(perf3, out_dir="R_meta/meta_sim_k30_n300_outputs_sd004")
 
-library(data.table)
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-library(scales)
 
+# Preparation for analysis
 mu_HR <- 0.75
 mu_logHR <- log(mu_HR)
 
@@ -44,14 +42,13 @@ meth_labels <- c(
   RM         = "RM (all recon)",
   Pooled_IPD = "Pooled IPD (oracle)"
 )
-
-
-
-methods <- as.data.table(sim2$res_methods_long)
+methods <- as.data.table(sim$res_methods_long)
 methods <- methods[method %in% meth_levels]
 methods[, method := factor(method, levels = meth_levels, labels = meth_labels[meth_levels])]
 
-# 过滤掉失败的rep（如果你想保守）
+
+
+# filter those who 1) meta-analysis converged (ok == TRUE) and 2) logHR_hat and se_hat are finite
 methods_ok <- methods[ok == TRUE & is.finite(logHR_hat) & is.finite(se_hat)]
 
 perf2 <- methods_ok[, .(
@@ -64,12 +61,12 @@ perf2 <- methods_ok[, .(
   mean_tau2_hat = mean(tau2_hat, na.rm=TRUE),
   mean_I2_hat = mean(I2_hat, na.rm=TRUE),
   mean_k_used = mean(k_used)
-), by = .(scenario_id, p_miss, tau_label, tau_logHR, n_label, n_per_arm, K, method)]
+), by = .(scenario_id, p_miss, tau_label, tau_logHR, n_label, n_per_arm, K, method, censoring)]
 
 
 
-# bias 的第二种画法
-p_bias <- ggplot(perf2, aes(x = p_miss, y = bias_logHR,
+# bias
+p_bias <- ggplot(perf2[perf2$censoring == "random"], aes(x = p_miss, y = bias_logHR,
                             color = method,    # 新增：按 method 分配颜色
                             group = method)) +  # 保持分组
   geom_hline(yintercept = 0, linewidth = 0.4) +
@@ -88,15 +85,15 @@ p_bias <- ggplot(perf2, aes(x = p_miss, y = bias_logHR,
   theme(legend.position = "bottom")
 p_bias
 
-# 检查bias的汇总表
+
 perf2 %>%
   select(p_miss, tau_label, method, bias_logHR) %>%
   filter(tau_label == "low") %>%
   arrange(tau_label, method, p_miss)
 
 
-# RMSE 的第二种画法
-p_rmse <- ggplot(perf2, aes(x = p_miss, y = rmse_logHR, group = method, color = method)) +
+# RMSE
+p_rmse <- ggplot(perf2[perf2$censoring == "front"], aes(x = p_miss, y = rmse_logHR, group = method, color = method)) +
   geom_hline(yintercept = 0, linewidth = 0.4) +
   geom_line(linewidth = 0.8) +
   geom_point(size = 2) +
@@ -112,7 +109,7 @@ p_rmse <- ggplot(perf2, aes(x = p_miss, y = rmse_logHR, group = method, color = 
   theme(legend.position = "bottom")
 p_rmse
 
-# 检查rmse的汇总表
+
 perf2 %>%
   select(p_miss, tau_label, method, rmse_logHR) %>%
   filter(tau_label == "low") %>%
@@ -120,6 +117,7 @@ perf2 %>%
   arrange(tau_label, method, p_miss)
 
 
+# k_used
 p_kused <- ggplot(methods_ok, aes(x = factor(p_miss), y = k_used, color = method)) +
   geom_boxplot(outlier.alpha = 0.3) +
   facet_grid(tau_label ~ method) +
@@ -131,10 +129,8 @@ p_kused <- ggplot(methods_ok, aes(x = factor(p_miss), y = k_used, color = method
   ) +
   theme_bw() +
   theme(legend.position = "right")
-
 p_kused
 
-# 计算 k_used 的统计摘要（按 p_miss、tau_label、method 分组）
 methods_ok %>%
   group_by(p_miss, tau_label, method) %>%
   summarise(
@@ -152,7 +148,7 @@ methods_ok %>%
 
 
 
-
+# AD-only方法的k_used和误差的关系
 ad <- methods_ok[method == meth_labels["AD_only"]]
 
 p_ad_scatter <- ggplot(ad, aes(x = k_used, y = abs(logHR_hat - mu_logHR))) +
@@ -166,6 +162,7 @@ p_ad_scatter <- ggplot(ad, aes(x = k_used, y = abs(logHR_hat - mu_logHR))) +
   theme_bw()
 
 p_ad_scatter
+
 
 # 数值相关性（每个tau、每个p_miss分别看）
 ad_cor <- ad[, .(

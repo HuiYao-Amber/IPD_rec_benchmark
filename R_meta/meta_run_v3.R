@@ -9,31 +9,26 @@ grid <- build_scenario_grid(
 )
 
 sim <- run_meta_simulation(grid, n_rep = 300)
-sim2 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
-sim3 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
-str(sim3)
-
-write.csv(sim2$res_methods_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004_more_points/sim_reps300_results_long.csv")
-write.csv(sim2$res_studies_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004_more_points/sim_reps300_studies_long.csv")
-
-write.csv(sim3$res_methods_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_results_long.csv")
-write.csv(sim3$res_studies_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_studies_long.csv")
-
 perf <- summarise_performance(sim$res_methods_long, mu_HR = 0.75)
 plot_bias_rmse(perf, out_dir = "R_meta/meta_sim_k30_n100_outputs")
 
+sim2 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
+write.csv(sim2$res_methods_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004_more_points/sim_reps300_results_long.csv")
+write.csv(sim2$res_studies_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004_more_points/sim_reps300_studies_long.csv")
 perf2 <- summarise_performance(sim2$res_methods_long, mu_HR=0.75)
 plot_bias_rmse(perf2, out_dir="R_meta")
 
+
+
+sim3 <- run_meta_simulation_paired(grid, n_rep=300, digitize_sd_S = 0.04)
+str(sim3)
+write.csv(sim3$res_methods_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_results_long.csv")
+write.csv(sim3$res_studies_long, file = "R_meta/meta_sim_k30_n300_outputs_sd004/sim_reps300_studies_long.csv")
 perf3 <- summarise_performance(sim3$res_methods_long, mu_HR=0.75)
 plot_bias_rmse(perf3, out_dir="R_meta/meta_sim_k30_n300_outputs_sd004")
 
-library(data.table)
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-library(scales)
 
+# Preparation for analysis
 mu_HR <- 0.75
 mu_logHR <- log(mu_HR)
 
@@ -44,14 +39,13 @@ meth_labels <- c(
   RM         = "RM (all recon)",
   Pooled_IPD = "Pooled IPD (oracle)"
 )
-
-
-
 methods <- as.data.table(sim2$res_methods_long)
 methods <- methods[method %in% meth_levels]
 methods[, method := factor(method, levels = meth_levels, labels = meth_labels[meth_levels])]
 
-# 过滤掉失败的rep（如果你想保守）
+
+
+# filter those who 1) meta-analysis converged (ok == TRUE) and 2) logHR_hat and se_hat are finite
 methods_ok <- methods[ok == TRUE & is.finite(logHR_hat) & is.finite(se_hat)]
 
 perf2 <- methods_ok[, .(
@@ -68,7 +62,7 @@ perf2 <- methods_ok[, .(
 
 
 
-# bias 的第二种画法
+# bias
 p_bias <- ggplot(perf2, aes(x = p_miss, y = bias_logHR,
                             color = method,    # 新增：按 method 分配颜色
                             group = method)) +  # 保持分组
@@ -88,14 +82,14 @@ p_bias <- ggplot(perf2, aes(x = p_miss, y = bias_logHR,
   theme(legend.position = "bottom")
 p_bias
 
-# 检查bias的汇总表
+
 perf2 %>%
   select(p_miss, tau_label, method, bias_logHR) %>%
   filter(tau_label == "low") %>%
   arrange(tau_label, method, p_miss)
 
 
-# RMSE 的第二种画法
+# RMSE
 p_rmse <- ggplot(perf2, aes(x = p_miss, y = rmse_logHR, group = method, color = method)) +
   geom_hline(yintercept = 0, linewidth = 0.4) +
   geom_line(linewidth = 0.8) +
@@ -112,7 +106,7 @@ p_rmse <- ggplot(perf2, aes(x = p_miss, y = rmse_logHR, group = method, color = 
   theme(legend.position = "bottom")
 p_rmse
 
-# 检查rmse的汇总表
+
 perf2 %>%
   select(p_miss, tau_label, method, rmse_logHR) %>%
   filter(tau_label == "low") %>%
@@ -120,6 +114,7 @@ perf2 %>%
   arrange(tau_label, method, p_miss)
 
 
+# k_used
 p_kused <- ggplot(methods_ok, aes(x = factor(p_miss), y = k_used, color = method)) +
   geom_boxplot(outlier.alpha = 0.3) +
   facet_grid(tau_label ~ method) +
@@ -131,10 +126,8 @@ p_kused <- ggplot(methods_ok, aes(x = factor(p_miss), y = k_used, color = method
   ) +
   theme_bw() +
   theme(legend.position = "right")
-
 p_kused
 
-# 计算 k_used 的统计摘要（按 p_miss、tau_label、method 分组）
 methods_ok %>%
   group_by(p_miss, tau_label, method) %>%
   summarise(
@@ -152,7 +145,7 @@ methods_ok %>%
 
 
 
-
+# AD-only方法的k_used和误差的关系
 ad <- methods_ok[method == meth_labels["AD_only"]]
 
 p_ad_scatter <- ggplot(ad, aes(x = k_used, y = abs(logHR_hat - mu_logHR))) +
@@ -166,6 +159,7 @@ p_ad_scatter <- ggplot(ad, aes(x = k_used, y = abs(logHR_hat - mu_logHR))) +
   theme_bw()
 
 p_ad_scatter
+
 
 # 数值相关性（每个tau、每个p_miss分别看）
 ad_cor <- ad[, .(

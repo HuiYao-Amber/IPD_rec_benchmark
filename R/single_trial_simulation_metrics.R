@@ -124,64 +124,8 @@ cox_logHR_diff <- function(true_ipd, rec_ipd) {
   b_rec - b_true
 }
 
-# ---- 3) Effect metric: Cox logHR difference (recon - true) ----
-cox_logHR_diff <- function(true_ipd, rec_ipd,
-                           coarsen_true_time = TRUE,
-                           min_events_per_arm = 5L,
-                           ties = "efron") {
-  true_ipd <- .fix_arm_labels(true_ipd)
-  rec_ipd  <- .fix_arm_labels(rec_ipd)
 
-  # Helper: infer a "typical" time step from reconstructed IPD (to mimic digitization grid)
-  infer_dt <- function(tt) {
-    tt <- tt[is.finite(tt)]
-    tt <- sort(unique(tt))
-    if (length(tt) < 2) return(NA_real_)
-    dd <- diff(tt)
-    dd <- dd[dd > 0]
-    if (!length(dd)) return(NA_real_)
-    stats::median(dd)
-  }
-
-  # Quick sanity: need both arms and enough events
-  if (anyNA(true_ipd$arm) || anyNA(rec_ipd$arm)) return(NA_real_)
-
-  ev_true <- tapply(true_ipd$status == 1, true_ipd$arm, sum)
-  ev_rec  <- tapply(rec_ipd$status == 1,  rec_ipd$arm,  sum)
-
-  if (length(ev_true) < 2 || length(ev_rec) < 2) return(NA_real_)
-  if (any(ev_true < min_events_per_arm) || any(ev_rec < min_events_per_arm)) return(NA_real_)
-
-  # Optional: coarsen true time to reconstructed grid to reduce tie-induced artificial differences
-  if (isTRUE(coarsen_true_time)) {
-    dt <- infer_dt(rec_ipd$time)
-    if (is.finite(dt) && dt > 0) {
-      true_ipd$time <- round(true_ipd$time / dt) * dt
-      # guard against negative due to rounding artifacts (shouldn't happen, but safe)
-      true_ipd$time[true_ipd$time < 0] <- 0
-    }
-  }
-
-  safe_beta <- function(ipd) {
-    tryCatch({
-      fit <- survival::coxph(survival::Surv(time, status) ~ arm, data = ipd, ties = ties)
-      b <- unname(stats::coef(fit)[["armTreatment"]])
-      if (!is.finite(b)) return(NA_real_)
-      b
-    }, error = function(e) NA_real_)
-  }
-
-  b_true <- safe_beta(true_ipd)
-  b_rec  <- safe_beta(rec_ipd)
-
-  if (!is.finite(b_true) || !is.finite(b_rec)) return(NA_real_)
-  b_rec - b_true
-}
-
-
-
-
-# ---- 4) Optional effect metric: RMST difference (recon - true) ----
+# ---- 4) RMST difference (recon - true) ----
 rmst_diff <- function(true_ipd, rec_ipd, tau, eps = 1e-6) {
   if (!requireNamespace("survRM2", quietly = TRUE)) return(NA_real_)
   true_ipd <- .fix_arm_labels(true_ipd)
@@ -264,9 +208,6 @@ evaluate_one_method <- function(true_ipd, digi_dt, rec_ipd, risk_table,
 # --------------------------
 # Minimal test example
 # --------------------------
-
-
-# 4) metrics
 tau <- res3$totals$tau_study_end
 curve_map <- c(Control = 1, Treatment = 2)
 

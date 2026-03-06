@@ -16,8 +16,9 @@
 # Notes:
 # - Heterogeneity is on logHR scale: logHR_k ~ Normal(log(mu_HR), tau_logHR^2)
 # - Baseline event times are Weibull PH with fixed shape + mean time.
-# - Censoring is "random" (Uniform(0, tau)), with tau calibrated to hit target
-#   censoring proportion (deterministically using fixed uniforms per trial).
+# - Censoring supports: "random" (Uniform(0, tau)), "front" (early; Beta(0.7,2)),
+#   and "back" (late; Beta(2,0.7)). Tau is calibrated to hit the target censoring
+#   proportion deterministically using fixed uniforms per trial.
 ###############################################################################
 
 ## ---- 0) Package checks ----
@@ -47,7 +48,7 @@ suppressPackageStartupMessages({
 
 `%||%` <- function(x, y) if (!is.null(x)) x else y
 
-## ---- 1) DGM helpers (Weibull PH + calibrated random censoring) ----
+## ---- 1) DGM helpers (Weibull PH + calibrated censoring) ----
 
 # Convert Weibull mean -> scale
 .weibull_scale_from_mean <- function(mean_time, shape){
@@ -80,14 +81,29 @@ make_censor_uniforms_simple <- function(n_control, n_treatment){
   )
 }
 
-# Realize IPD under random censoring:
+## [MOD] Generalize censoring to include front/back.
+##       Mirrors single_trial_simulation_DGM.R (front/back via Beta quantiles).
+
+# Realize IPD under specified censoring pattern (random/front/back):
 #   T: latent event times
-#   C: Uniform(0, tau) LTFU
+#   C: LTFU clock scaled to (0, tau)
 #   Admin cap: tau
-realize_ipd_random <- function(tau, T_control, T_treat, U){
+realize_ipd_random <- function(tau, T_control, T_treat, U, censoring = c("random","front","back")){
+  censoring <- match.arg(censoring)
   stopifnot(is.finite(tau), tau > 0)
-  C_control <- U$U_C_control * tau
-  C_treat   <- U$U_C_treat   * tau
+
+  if (censoring == "random") {
+    C_control <- U$U_C_control * tau
+    C_treat   <- U$U_C_treat   * tau
+  } else if (censoring == "front") {
+    # Early censoring: Beta(a<1, b>1) concentrated near 0
+    C_control <- stats::qbeta(U$U_C_control, 0.5, 3.0) * tau
+    C_treat   <- stats::qbeta(U$U_C_treat,   0.5, 3.0) * tau
+  } else {
+    # Late censoring: Beta(a>1, b<1) concentrated near 1
+    C_control <- stats::qbeta(U$U_C_control, 8.0, 0.2) * tau
+    C_treat   <- stats::qbeta(U$U_C_treat,   8.0, 0.2) * tau
+  }
 
   X_control <- pmin(T_control, C_control, tau)
   D_control <- as.integer(T_control <= C_control & T_control <= tau)
@@ -111,20 +127,22 @@ realize_ipd_random <- function(tau, T_control, T_treat, U){
   )
 }
 
-# Calibrate tau so censor_prop(tau) ~= target_censoring (random censoring)
+# Calibrate tau so censor_prop(tau) ~= target_censoring (random/front/back)
 calibrate_tau_random <- function(
     target_censoring,
     T_control,
     T_treat,
     U,
+    censoring = c("random","front","back"),
     tol = 1e-4,
     tau_hi_init = NULL,
     tau_cap = 1e5
 ){
+  censoring <- match.arg(censoring)
   stopifnot(target_censoring >= 0, target_censoring <= 0.95)
 
   f_root <- function(tau){
-    realize_ipd_random(tau, T_control, T_treat, U)$censor_prop - target_censoring
+    realize_ipd_random(tau, T_control, T_treat, U, censoring = censoring)$censor_prop - target_censoring
   }
 
   tau_lo <- 1e-6
@@ -200,9 +218,11 @@ simulate_trial_one <- function(
     n_treatment,
     shape = 1.0,
     mean_time = 10,
+    censoring = c("random","front","back"),
     target_censoring = 0.30,
     seed = NULL
 ){
+  censoring <- match.arg(censoring)
   if (!is.null(seed)) set.seed(seed)
 
   scn <- make_scn_weibull_ph(hr = hr, shape = shape, mean_time = mean_time)
@@ -218,10 +238,11 @@ simulate_trial_one <- function(
     target_censoring = target_censoring,
     T_control = T_control,
     T_treat = T_treat,
-    U = U
+    U = U,
+    censoring = censoring
   )
 
-  R <- realize_ipd_random(tau_star, T_control, T_treat, U)
+  R <- realize_ipd_random(tau_star, T_control, T_treat, U, censoring = censoring)
   ipd <- R$ipd
 
   axis <- compute_pretty_axis(ipd, multiple = 8L)
@@ -259,93 +280,28 @@ estimate_logHR_cox <- function(ipd){
 }
 
 # Numeric digitization: evaluate KM step function on a grid, add noise, enforce monotonicity.
-# digitize_km_numeric <- function(
-#     ipd_true,
-#     n_grid = 200,
-#     sd_S = 0.01,
-#     x_end_plot = NULL
-# ){
-#   stopifnot(is.data.frame(ipd_true), all(c("time","status","arm") %in% names(ipd_true)))
-#   ipd_true$arm <- factor(ipd_true$arm, levels = c("Control", "Treatment"))
-#
-#   axis <- compute_pretty_axis(ipd_true, multiple = 8L)
-#   x_end <- x_end_plot %||% axis$x_end_plot
-#
-#   time_grid <- seq(0, x_end, length.out = as.integer(n_grid))
-#
-#   km_on_grid <- function(arm_label){
-#     dat <- ipd_true[ipd_true$arm == arm_label, c("time","status"), drop = FALSE]
-#     fit <- survival::survfit(survival::Surv(time, status) ~ 1, data = dat)
-#
-#     ss <- summary(fit, times = time_grid, extend = TRUE)
-#     St <- ss$surv
-#
-#     # Safety: replace any NA with last observation carried forward
-#     if (anyNA(St)) {
-#       idx_na <- which(is.na(St))
-#       for (i in idx_na) {
-#         St[i] <- if (i == 1L) 1 else St[i - 1L]
-#       }
-#     }
-#
-#     # Add noise (except enforce start at 1)
-#     St_noisy <- St + stats::rnorm(length(St), mean = 0, sd = sd_S)
-#     St_noisy[1] <- 1
-#
-#     # bound + enforce non-increasing
-#     St_noisy <- pmin(pmax(St_noisy, 0), 1)
-#     St_noisy <- cummin(St_noisy)
-#     St_noisy[1] <- 1
-#
-#     data.table(time = time_grid, St = St_noisy)
-#   }
-#
-#   dC <- km_on_grid("Control")
-#   dT <- km_on_grid("Treatment")
-#
-#   dC[, curve := 1L]
-#   dT[, curve := 2L]
-#
-#   digi_dt <- rbindlist(list(dC, dT), use.names = TRUE)
-#   setorder(digi_dt, curve, time)
-#
-#   list(
-#     data = digi_dt,
-#     axis = axis,
-#     time_grid = time_grid
-#   )
-# }
-
-# ---- 2) Estimation + digitization + reconstruction ----
-
-# 多打点
 digitize_km_numeric <- function(
     ipd_true,
-    risk_table,           # 风险表（包含trisk时间点）
-    n_digitize = 100,     # 数字化点个数（模拟手动打点）
-    sd_S = 0.01
+    n_grid = 200,
+    sd_S = 0.01,
+    x_end_plot = NULL
 ){
   stopifnot(is.data.frame(ipd_true), all(c("time","status","arm") %in% names(ipd_true)))
-  stopifnot(is.data.frame(risk_table), "time" %in% names(risk_table))
-
   ipd_true$arm <- factor(ipd_true$arm, levels = c("Control", "Treatment"))
 
-  # 风险表时间点（用于重建）
-  trisk <- risk_table$time
+  axis <- compute_pretty_axis(ipd_true, multiple = 8L)
+  x_end <- x_end_plot %||% axis$x_end_plot
 
-  # 生成密集时间网格（用于数字化）
-  x_end <- max(trisk)
-  time_grid <- seq(0, x_end, length.out = n_digitize)
+  time_grid <- seq(0, x_end, length.out = as.integer(n_grid))
 
   km_on_grid <- function(arm_label){
     dat <- ipd_true[ipd_true$arm == arm_label, c("time","status"), drop = FALSE]
     fit <- survival::survfit(survival::Surv(time, status) ~ 1, data = dat)
 
-    # 在密集时间点提取生存概率
     ss <- summary(fit, times = time_grid, extend = TRUE)
     St <- ss$surv
 
-    # 处理NA
+    # Safety: replace any NA with last observation carried forward
     if (anyNA(St)) {
       idx_na <- which(is.na(St))
       for (i in idx_na) {
@@ -353,11 +309,11 @@ digitize_km_numeric <- function(
       }
     }
 
-    # 添加噪声（模拟读点误差）
+    # Add noise (except enforce start at 1)
     St_noisy <- St + stats::rnorm(length(St), mean = 0, sd = sd_S)
     St_noisy[1] <- 1
 
-    # 边界限制 + 强制非增
+    # bound + enforce non-increasing
     St_noisy <- pmin(pmax(St_noisy, 0), 1)
     St_noisy <- cummin(St_noisy)
     St_noisy[1] <- 1
@@ -375,70 +331,11 @@ digitize_km_numeric <- function(
   setorder(digi_dt, curve, time)
 
   list(
-    data = digi_dt,          # 密集数字化点（用于重建）
-    risk_table = risk_table, # 风险表（包含trisk，用于preprocess）
-    time_grid = time_grid,
-    trisk = trisk
+    data = digi_dt,
+    axis = axis,
+    time_grid = time_grid
   )
 }
-
-
-# 修改：数字化直接在风险表时间点上提取KM值，缺点是打点少
-# digitize_km_numeric <- function(
-#     ipd_true,
-#     risk_table,          # 新增参数：风险表（包含时间点）
-#     sd_S = 0.1
-# ){
-#   stopifnot(is.data.frame(ipd_true), all(c("time","status","arm") %in% names(ipd_true)))
-#   stopifnot(is.data.frame(risk_table), "time" %in% names(risk_table))
-#
-#   ipd_true$arm <- factor(ipd_true$arm, levels = c("Control", "Treatment"))
-#
-#   times <- risk_table$time   # 使用风险表的时间点（即trisk）
-#
-#   km_on_grid <- function(arm_label){
-#     dat <- ipd_true[ipd_true$arm == arm_label, c("time","status"), drop = FALSE]
-#     fit <- survival::survfit(survival::Surv(time, status) ~ 1, data = dat)
-#
-#     # 在指定时间点提取生存概率
-#     ss <- summary(fit, times = times, extend = TRUE)
-#     St <- ss$surv
-#
-#     # 处理NA（可能由于extend=TRUE引入，但一般不会）
-#     if (anyNA(St)) {
-#       idx_na <- which(is.na(St))
-#       for (i in idx_na) {
-#         St[i] <- if (i == 1L) 1 else St[i - 1L]
-#       }
-#     }
-#
-#     # 添加噪声（除第一个点强制为1）
-#     St_noisy <- St + stats::rnorm(length(St), mean = 0, sd = sd_S)
-#     St_noisy[1] <- 1
-#
-#     # 边界限制 + 强制非增
-#     St_noisy <- pmin(pmax(St_noisy, 0), 1)
-#     St_noisy <- cummin(St_noisy)
-#     St_noisy[1] <- 1
-#
-#     data.table(time = times, St = St_noisy)
-#   }
-#
-#   dC <- km_on_grid("Control")
-#   dT <- km_on_grid("Treatment")
-#
-#   dC[, curve := 1L]
-#   dT[, curve := 2L]
-#
-#   digi_dt <- rbindlist(list(dC, dT), use.names = TRUE)
-#   setorder(digi_dt, curve, time)
-#
-#   list(
-#     data = digi_dt,
-#     risk_table = risk_table,   # 保留风险表以备重建使用
-#     times = times
-#   )
-# }
 
 # Two-arm reconstruction using IPDfromKM only
 reconstruct_ipd_IPDfromKM <- function(
@@ -571,143 +468,23 @@ pool_ipd_estimate <- function(ipd_list_true){
 
 ## ---- 4) One replication for one scenario ----
 
-# simulate_one_rep_meta <- function(
-#     K = 10,
-#     mu_HR = 0.75,
-#     tau_logHR = 0.05,
-#     n_control = 250,
-#     n_treatment = 250,
-#     target_censoring = 0.30,
-#     p_miss = 0.6,
-#     weib_shape = 1.0,
-#     weib_mean_time = 10,
-#     digitize_n_grid = 200,
-#     digitize_sd_S = 0.01,
-#     re_method = "REML",
-#     seed = NULL
-# ){
-#   if (!is.null(seed)) set.seed(seed)
-#
-#   # trial-specific true effects
-#   logHR_k <- stats::rnorm(K, mean = log(mu_HR), sd = tau_logHR)
-#   HR_k <- exp(logHR_k)
-#
-#   # storage
-#   per_trial <- vector("list", K)
-#   ipd_true_list <- vector("list", K)
-#
-#   for (k in seq_len(K)) {
-#     tr <- simulate_trial_one(
-#       hr = HR_k[k],
-#       n_control = n_control,
-#       n_treatment = n_treatment,
-#       shape = weib_shape,
-#       mean_time = weib_mean_time,
-#       target_censoring = target_censoring,
-#       seed = NULL
-#     )
-#
-#     ipd_true_list[[k]] <- tr$ipd
-#
-#     # "reported" HR from true IPD
-#     est_true <- estimate_logHR_cox(tr$ipd)
-#
-#     # digitize + reconstruct
-#     digi <- digitize_km_numeric(tr$ipd, n_grid = digitize_n_grid, sd_S = digitize_sd_S)
-#
-#     rec <- tryCatch({
-#       reconstruct_ipd_IPDfromKM(
-#         digi_dt = digi$data,
-#         risk_table = tr$risk_table,
-#         total_events = NULL,
-#         curve_map = c(Control = 1, Treatment = 2)
-#       )
-#     }, error = function(e){
-#       list(ipd = NULL, err = conditionMessage(e))
-#     })
-#
-#     if (is.null(rec$ipd)) {
-#       est_rec <- list(ok = FALSE, logHR = NA_real_, se = NA_real_, err = rec$err %||% "reconstruction_failed")
-#       rec_ok <- FALSE
-#     } else {
-#       est_rec <- estimate_logHR_cox(rec$ipd)
-#       rec_ok <- isTRUE(est_rec$ok)
-#     }
-#
-#     per_trial[[k]] <- data.table(
-#       trial = k,
-#       HR_gen = HR_k[k],
-#       logHR_gen = logHR_k[k],
-#       censor_prop = tr$censor_prop,
-#       tot_ev_ctrl = tr$total_events["Control"],
-#       tot_ev_trt  = tr$total_events["Treatment"],
-#       logHR_true_hat = est_true$logHR,
-#       se_true_hat    = est_true$se,
-#       true_ok        = isTRUE(est_true$ok),
-#       logHR_recon_hat = est_rec$logHR,
-#       se_recon_hat    = est_rec$se,
-#       recon_ok        = rec_ok
-#     )
-#   }
-#
-#   per_study_dt <- rbindlist(per_trial)
-#
-#   # impose random missingness on reported HR
-#   is_missing <- stats::rbinom(K, size = 1, prob = p_miss) == 1
-#   per_study_dt[, is_missing := is_missing]
-#
-#   # Assemble per-method meta inputs
-#   # AD-only: keep only studies with reported HR (true IPD estimate)
-#   idx_ad <- which(!per_study_dt$is_missing & is.finite(per_study_dt$logHR_true_hat) & is.finite(per_study_dt$se_true_hat))
-#
-#   # Hybrid: reported uses true HR; missing uses reconstructed HR
-#   logHR_hyb <- ifelse(per_study_dt$is_missing, per_study_dt$logHR_recon_hat, per_study_dt$logHR_true_hat)
-#   se_hyb    <- ifelse(per_study_dt$is_missing, per_study_dt$se_recon_hat,    per_study_dt$se_true_hat)
-#
-#   # RM: all reconstructed
-#   logHR_rm <- per_study_dt$logHR_recon_hat
-#   se_rm    <- per_study_dt$se_recon_hat
-#
-#   # Pooled IPD (truth)
-#   pooled <- pool_ipd_estimate(ipd_true_list)
-#
-#   # Fit meta models
-#   fit_ad  <- meta_fit_rma(per_study_dt$logHR_true_hat[idx_ad], per_study_dt$se_true_hat[idx_ad], re_method = re_method)
-#   fit_hyb <- meta_fit_rma(logHR_hyb, se_hyb, re_method = re_method)
-#   fit_rm  <- meta_fit_rma(logHR_rm,  se_rm,  re_method = re_method)
-#
-#   per_method_dt <- rbindlist(list(
-#     data.table(method = "AD_only",   ok = fit_ad$ok,  logHR_hat = fit_ad$logHR,  se_hat = fit_ad$se,  tau2_hat = fit_ad$tau2,  I2_hat = fit_ad$I2,  k_used = fit_ad$k),
-#     data.table(method = "Hybrid",    ok = fit_hyb$ok, logHR_hat = fit_hyb$logHR, se_hat = fit_hyb$se, tau2_hat = fit_hyb$tau2, I2_hat = fit_hyb$I2, k_used = fit_hyb$k),
-#     data.table(method = "RM",        ok = fit_rm$ok,  logHR_hat = fit_rm$logHR,  se_hat = fit_rm$se,  tau2_hat = fit_rm$tau2,  I2_hat = fit_rm$I2,  k_used = fit_rm$k),
-#     data.table(method = "Pooled_IPD", ok = pooled$ok, logHR_hat = pooled$logHR, se_hat = pooled$se, tau2_hat = NA_real_, I2_hat = NA_real_, k_used = K)
-#   ), use.names = TRUE)
-#
-#   per_method_dt[, HR_hat := exp(logHR_hat)]
-#
-#   list(
-#     per_study_dt = per_study_dt,
-#     per_method_dt = per_method_dt
-#   )
-# }
-
-
-
 simulate_one_rep_meta <- function(
     K = 10,
     mu_HR = 0.75,
     tau_logHR = 0.05,
     n_control = 250,
     n_treatment = 250,
+    censoring = c("random","front","back"),
     target_censoring = 0.30,
     p_miss = 0.6,
     weib_shape = 1.0,
     weib_mean_time = 10,
     digitize_n_grid = 200,
-    digitize_sd_S = 0.04,
+    digitize_sd_S = 0.01,
     re_method = "REML",
     seed = NULL
 ){
+  censoring <- match.arg(censoring)
   if (!is.null(seed)) set.seed(seed)
 
   # trial-specific true effects
@@ -719,15 +496,15 @@ simulate_one_rep_meta <- function(
   ipd_true_list <- vector("list", K)
 
   for (k in seq_len(K)) {
-    trial_seed <- if (!is.null(seed)) seed + k else NULL   # 为每个试验设置不同种子
     tr <- simulate_trial_one(
       hr = HR_k[k],
       n_control = n_control,
       n_treatment = n_treatment,
       shape = weib_shape,
       mean_time = weib_mean_time,
+      censoring = censoring,
       target_censoring = target_censoring,
-      seed = trial_seed    # 传入种子
+      seed = NULL
     )
 
     ipd_true_list[[k]] <- tr$ipd
@@ -736,13 +513,13 @@ simulate_one_rep_meta <- function(
     est_true <- estimate_logHR_cox(tr$ipd)
 
     # digitize + reconstruct
-    digi <- digitize_km_numeric(tr$ipd, tr$risk_table)
+    digi <- digitize_km_numeric(tr$ipd, n_grid = digitize_n_grid, sd_S = digitize_sd_S)
 
     rec <- tryCatch({
       reconstruct_ipd_IPDfromKM(
         digi_dt = digi$data,
         risk_table = tr$risk_table,
-        total_events = NULL,
+        total_events = tr$total_events,
         curve_map = c(Control = 1, Treatment = 2)
       )
     }, error = function(e){
@@ -784,26 +561,12 @@ simulate_one_rep_meta <- function(
   idx_ad <- which(!per_study_dt$is_missing & is.finite(per_study_dt$logHR_true_hat) & is.finite(per_study_dt$se_true_hat))
 
   # Hybrid: reported uses true HR; missing uses reconstructed HR
-  # 在 per_study_dt 中已有 recon_ok 列
-  # 构造Hybrid的logHR和se：对于缺失的试验，仅当重建成功时才使用重建值，否则仍为缺失
-  logHR_hyb <- per_study_dt$logHR_true_hat   # 默认用真值
-  se_hyb    <- per_study_dt$se_true_hat
+  logHR_hyb <- ifelse(per_study_dt$is_missing, per_study_dt$logHR_recon_hat, per_study_dt$logHR_true_hat)
+  se_hyb    <- ifelse(per_study_dt$is_missing, per_study_dt$se_recon_hat,    per_study_dt$se_true_hat)
 
-  # 对于缺失的试验
-  miss_idx <- which(per_study_dt$is_missing)
-  for (i in miss_idx) {
-    if (per_study_dt$recon_ok[i]) {
-      logHR_hyb[i] <- per_study_dt$logHR_recon_hat[i]
-      se_hyb[i]    <- per_study_dt$se_recon_hat[i]
-    } else {
-      logHR_hyb[i] <- NA_real_   # 重建失败，视为缺失
-      se_hyb[i]    <- NA_real_
-    }
-  }
-
-  # RM方法：仅使用重建成功的试验（重建失败的设为NA）
-  logHR_rm <- ifelse(per_study_dt$recon_ok, per_study_dt$logHR_recon_hat, NA_real_)
-  se_rm    <- ifelse(per_study_dt$recon_ok, per_study_dt$se_recon_hat, NA_real_)
+  # RM: all reconstructed
+  logHR_rm <- per_study_dt$logHR_recon_hat
+  se_rm    <- per_study_dt$se_recon_hat
 
   # Pooled IPD (truth)
   pooled <- pool_ipd_estimate(ipd_true_list)
@@ -834,158 +597,143 @@ build_scenario_grid <- function(
     p_miss_vec = c(0.3, 0.6, 0.9),
     tau_levels = list(low = 0.05, high = 0.25),
     n_levels = list(standard = 250),
+    censoring_vec = c("random"),
     K = 10
 ){
   grid <- CJ(
     p_miss = as.numeric(p_miss_vec),
     tau_label = names(tau_levels),
-    n_label = names(n_levels)
+    n_label = names(n_levels),
+    censoring = as.character(censoring_vec)
   )
 
   grid[, tau_logHR := unlist(tau_levels)[match(tau_label, names(tau_levels))]]
   grid[, n_per_arm := unlist(n_levels)[match(n_label, names(n_levels))]]
   grid[, K := as.integer(K)]
 
-  grid[, scenario_id := sprintf("n%d_K%d_miss%02d_tau%s",
-                               n_per_arm,
-                               K,
-                               as.integer(round(100 * p_miss)),
-                               ifelse(tau_label == "low", "L", "H"))]
+  # [MOD] Backward compatible scenario_id for random censoring; add suffix for front/back.
+  base_id <- sprintf("n%d_K%d_miss%02d_tau%s",
+                     grid$n_per_arm,
+                     grid$K,
+                     as.integer(round(100 * grid$p_miss)),
+                     ifelse(grid$tau_label == "low", "L", "H"))
+  grid[, scenario_id := ifelse(
+    censoring == "random",
+    base_id,
+    paste0(base_id, "_cen", toupper(substr(censoring, 1, 1)))
+  )]
 
   grid[]
 }
 
-run_meta_simulation_paired <- function(grid, n_rep=200, seed_base=20360220L,
-                                       mu_HR=0.75, digitize_n_grid=200, digitize_sd_S=0.01) {
-  library(data.table)
+run_meta_simulation <- function(
+    scenario_grid,
+    n_rep = 200,
+    seed_base = 20260219,
+    mu_HR = 0.75,
+    target_censoring = 0.30,
+    weib_shape = 1.0,
+    weib_mean_time = 10,
+    digitize_n_grid = 200,
+    digitize_sd_S = 0.01,
+    re_method = "REML",
+    verbose = TRUE
+){
+  stopifnot(is.data.table(scenario_grid))
 
-  grid <- as.data.table(grid)
-  res_methods_all <- list()
-  res_studies_all <- list()
+  out_methods <- list()
+  out_studies <- list()
   idx <- 1L
 
-  # 把 grid 拆成“基础世界”：不包含 p_miss，只包含 tau/n/K
-  base_worlds <- unique(grid[, .(tau_label, tau_logHR, n_label, n_per_arm, K)])
-
-  for (b in seq_len(nrow(base_worlds))) {
-    bw <- base_worlds[b]
-    tau_label <- bw$tau_label
-    tau_logHR <- bw$tau_logHR
-    n_per_arm <- bw$n_per_arm
-    K <- bw$K
-    n_label <- bw$n_label
+  for (s in seq_len(nrow(scenario_grid))) {
+    scn <- scenario_grid[s]
+    if (isTRUE(verbose)) {
+      message(sprintf("[Scenario %d/%d] %s", s, nrow(scenario_grid), scn$scenario_id))
+    }
 
     for (r in seq_len(n_rep)) {
-      # 固定一个 base world + rep 的种子 -> 固定一套 trials + digitize + recon
-      seed_world <- seed_base + 100000L*b + r
+      seed <- seed_base + 100000L * s + r
+
       one <- simulate_one_rep_meta(
-        K=K, mu_HR=mu_HR, tau_logHR=tau_logHR,
-        n_control=n_per_arm, n_treatment=n_per_arm,
-        p_miss=0.0,  # 先生成完整世界（missing 暂时不用）
-        digitize_n_grid=digitize_n_grid, digitize_sd_S=digitize_sd_S,
-        seed=seed_world
+        K = scn$K,
+        mu_HR = mu_HR,
+        tau_logHR = scn$tau_logHR,
+        n_control = scn$n_per_arm,
+        n_treatment = scn$n_per_arm,
+        # [MOD] Pass censoring mode from scenario grid (default random).
+        censoring = scn$censoring %||% "random",
+        target_censoring = target_censoring,
+        p_miss = scn$p_miss,
+        weib_shape = weib_shape,
+        weib_mean_time = weib_mean_time,
+        digitize_n_grid = digitize_n_grid,
+        digitize_sd_S = digitize_sd_S,
+        re_method = re_method,
+        seed = seed
       )
 
-      # trial-level 固定
-      stud <- as.data.table(one$per_study_dt)
-      stud[, `:=`(tau_label=tau_label, tau_logHR=tau_logHR, n_label=n_label, n_per_arm=n_per_arm, K=K, rep=r, seed=seed_world)]
+      mdt <- one$per_method_dt
+      mdt[, `:=`(
+        scenario_id = scn$scenario_id,
+        p_miss = scn$p_miss,
+        tau_label = scn$tau_label,
+        tau_logHR = scn$tau_logHR,
+        n_label = scn$n_label,
+        n_per_arm = scn$n_per_arm,
+        # [MOD] Keep censoring mode in outputs for stratified summaries/plots.
+        censoring = scn$censoring %||% "random",
+        K = scn$K,
+        rep = r,
+        seed = seed
+      )]
 
-      # 固定一组 u_k，让 missing 集合随 p_miss 嵌套
-      set.seed(seed_world + 9999L)
-      u <- runif(K)
-      stud[, u_missing := u]
+      sdt <- one$per_study_dt
+      sdt[, `:=`(
+        scenario_id = scn$scenario_id,
+        p_miss = scn$p_miss,
+        tau_label = scn$tau_label,
+        tau_logHR = scn$tau_logHR,
+        n_label = scn$n_label,
+        n_per_arm = scn$n_per_arm,
+        # [MOD] Keep censoring mode in outputs for stratified summaries/plots.
+        censoring = scn$censoring %||% "random",
+        K = scn$K,
+        rep = r,
+        seed = seed
+      )]
 
-      # 对 grid 里所有 p_miss 做派生
-      pm_values <- sort(unique(grid$p_miss))
-      for (pm in pm_values) {
-        stud_pm <- copy(stud)
-        stud_pm[, `:=`(p_miss=pm, is_missing = (u_missing < pm))]
+      out_methods[[idx]] <- mdt
+      out_studies[[idx]] <- sdt
+      idx <- idx + 1L
 
-        mu_logHR <- log(mu_HR)
-
-        # ---- AD-only: only non-missing TRUE HR ----
-        ad <- stud_pm[is_missing==FALSE & true_ok==TRUE & is.finite(logHR_true_hat) & is.finite(se_true_hat) & se_true_hat>0]
-        fit_ad <- meta_fit_rma(ad$logHR_true_hat, ad$se_true_hat)
-        ad_row <- data.table(
-          method = "AD_only",
-          ok = fit_ad$ok,
-          logHR_hat = fit_ad$logHR,
-          se_hat = fit_ad$se,
-          tau2_hat = fit_ad$tau2,
-          I2_hat = fit_ad$I2,
-          k_used = fit_ad$k
-        )
-
-        # ---- Hybrid: non-missing TRUE HR + missing RECON HR ----
-        hy <- rbind(
-          stud_pm[is_missing==FALSE & true_ok==TRUE, .(logHR=logHR_true_hat, se=se_true_hat)],
-          stud_pm[is_missing==TRUE  & recon_ok==TRUE, .(logHR=logHR_recon_hat, se=se_recon_hat)]
-        )
-        fit_hy <- meta_fit_rma(hy$logHR, hy$se)
-        hy_row <- data.table(
-          method = "Hybrid",
-          ok = fit_hy$ok,
-          logHR_hat = fit_hy$logHR,
-          se_hat = fit_hy$se,
-          tau2_hat = fit_hy$tau2,
-          I2_hat = fit_hy$I2,
-          k_used = fit_hy$k
-        )
-
-        # ---- RM: all recon (should be constant across pm) ----
-        rm <- stud_pm[recon_ok==TRUE & is.finite(logHR_recon_hat) & is.finite(se_recon_hat) & se_recon_hat>0]
-        fit_rm <- meta_fit_rma(rm$logHR_recon_hat, rm$se_recon_hat)
-        rm_row <- data.table(
-          method = "RM",
-          ok = fit_rm$ok,
-          logHR_hat = fit_rm$logHR,
-          se_hat = fit_rm$se,
-          tau2_hat = fit_rm$tau2,
-          I2_hat = fit_rm$I2,
-          k_used = fit_rm$k
-        )
-
-        # ---- Pooled IPD: reuse from one (already constant) ----
-        pool_row <- one$per_method_dt[method=="Pooled_IPD", .(
-          method, ok, logHR_hat, se_hat,
-          tau2_hat = NA_real_, I2_hat = NA_real_, k_used = K
-        )]
-
-        methods_pm <- rbindlist(list(ad_row, hy_row, rm_row, pool_row), fill=TRUE)
-
-        methods_pm[, `:=`(
-          scenario_id = sprintf("n%d_K%d_miss%02d_tau%s", n_per_arm, K, as.integer(pm*100), ifelse(tau_label=="low","L","H")),
-          p_miss = pm, tau_label=tau_label, tau_logHR=tau_logHR,
-          n_label=n_label, n_per_arm=n_per_arm, K=K, rep=r, seed=seed_world
-        )]
-        methods_pm[, err := logHR_hat - mu_logHR]
-        methods_pm[, HR_hat := exp(logHR_hat)]
-
-        res_methods_all[[idx]] <- methods_pm
-        res_studies_all[[idx]] <- stud_pm
-        idx <- idx + 1L
+      if (isTRUE(verbose) && (r %% max(1L, floor(n_rep/5))) == 0L) {
+        message(sprintf("  rep %d/%d", r, n_rep))
       }
     }
   }
 
+  res_methods_long <- rbindlist(out_methods, use.names = TRUE, fill = TRUE)
+  res_studies_long <- rbindlist(out_studies, use.names = TRUE, fill = TRUE)
+
   list(
-    res_methods_long = rbindlist(res_methods_all, fill=TRUE),
-    res_studies_long = rbindlist(res_studies_all, fill=TRUE)
+    res_methods_long = res_methods_long,
+    res_studies_long = res_studies_long
   )
 }
 
-
-
 ## ---- 6) Summaries + plotting ----
-summarise_performance <- function(res_methods_long, mu_HR = 0.75, alpha = 0.05){
+
+summarise_performance <- function(res_methods_long, mu_HR = 0.75){
   stopifnot(is.data.table(res_methods_long))
   target <- log(mu_HR)
-  z <- qnorm(1 - alpha/2)
 
   res_methods_long[, err := logHR_hat - target]
-  res_methods_long[, ci_lower := logHR_hat - z * se_hat]
-  res_methods_long[, ci_upper := logHR_hat + z * se_hat]
-  res_methods_long[, cover := (ci_lower <= target) & (ci_upper >= target)]
+
+  # [MOD] If censoring is present, keep it in the grouping variables.
+  by_vars <- c("scenario_id", "p_miss", "tau_label", "tau_logHR", "n_label", "n_per_arm", "K", "method")
+  if ("censoring" %in% names(res_methods_long)) {
+    by_vars <- c("scenario_id", "p_miss", "tau_label", "tau_logHR", "n_label", "n_per_arm", "censoring", "K", "method")
+  }
 
   perf <- res_methods_long[, .(
     n_rep = .N,
@@ -993,46 +741,34 @@ summarise_performance <- function(res_methods_long, mu_HR = 0.75, alpha = 0.05){
     mean_k_used = mean(k_used, na.rm = TRUE),
     bias = mean(err, na.rm = TRUE),
     abs_bias = mean(abs(err), na.rm = TRUE),
-    rmse = sqrt(mean(err^2, na.rm = TRUE)),
-    coverage = mean(cover, na.rm = TRUE)    # 新增
-  ), by = .(scenario_id, p_miss, tau_label, tau_logHR, n_label, n_per_arm, K, method)]
+    rmse = sqrt(mean(err^2, na.rm = TRUE))
+  ), by = by_vars]
 
   perf[]
 }
 
-# summarise_performance <- function(res_methods_long, mu_HR = 0.75){
-#   stopifnot(is.data.table(res_methods_long))
-#   target <- log(mu_HR)
-#
-#   res_methods_long[, err := logHR_hat - target]
-#
-#   perf <- res_methods_long[, .(
-#     n_rep = .N,
-#     fail_rate = mean(!is.finite(logHR_hat)),
-#     mean_k_used = mean(k_used, na.rm = TRUE),
-#     bias = mean(err, na.rm = TRUE),
-#     abs_bias = mean(abs(err), na.rm = TRUE),
-#     rmse = sqrt(mean(err^2, na.rm = TRUE))
-#   ), by = .(scenario_id, p_miss, tau_label, tau_logHR, n_label, n_per_arm, K, method)]
-#
-#   perf[]
-# }
-
 plot_bias_rmse <- function(perf_dt, out_dir = NULL){
   stopifnot(is.data.table(perf_dt))
+
+  # [MOD] If censoring is present, facet by censoring as an additional row.
+  facet_form <- if ("censoring" %in% names(perf_dt)) {
+    censoring + tau_label ~ n_label
+  } else {
+    tau_label ~ n_label
+  }
 
   # bias plot
   p_bias <- ggplot(perf_dt, aes(x = p_miss, y = bias, color = method, group = method)) +
     geom_line() +
     geom_point(size = 2) +
-    facet_grid(tau_label ~ n_label, scales = "free_y") +
+    facet_grid(facet_form, scales = "free_y") +
     labs(x = "Missing HR proportion", y = "Bias (logHR scale)", title = "Meta-estimator bias vs missingness")
 
   # rmse plot
   p_rmse <- ggplot(perf_dt, aes(x = p_miss, y = rmse, color = method, group = method)) +
     geom_line() +
     geom_point(size = 2) +
-    facet_grid(tau_label ~ n_label, scales = "free_y") +
+    facet_grid(facet_form, scales = "free_y") +
     labs(x = "Missing HR proportion", y = "RMSE (logHR scale)", title = "Meta-estimator RMSE vs missingness")
 
   if (!is.null(out_dir)) {
@@ -1053,7 +789,9 @@ if (sys.nframe() == 0) {
     K = 10,
     n_rep = 200,
     target_censoring = 0.30,
-    p_miss_vec = c(0, 0.3, 0.6, 0.9),
+    p_miss_vec = c(0.3, 0.6, 0.9),
+    # [MOD] Censoring patterns to simulate. Keep default "random" for backward compatibility.
+    censoring_vec = c("random"),
     tau_levels = list(low = 0.05, high = 0.25),
     n_levels = list(standard = 250),
     weib_shape = 1.0,
@@ -1074,6 +812,7 @@ if (sys.nframe() == 0) {
     p_miss_vec = settings$p_miss_vec,
     tau_levels = settings$tau_levels,
     n_levels = settings$n_levels,
+    censoring_vec = settings$censoring_vec,
     K = settings$K
   )
 
