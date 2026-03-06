@@ -18,6 +18,7 @@ meta_benchmark_results_*/
 R_meta/*.png
 R_meta/*.pdf
 R/single_trial_case_demo*/
+task2_censor_plots/
 
 # 其他
 .DS_Store

@@ -89,7 +89,7 @@ digitize_km_event_times <- function(
     p_mark_use <- max(min(as.numeric(p_mark)[1], 1), 0)
     if (p_mark_use < 1) {
       keep <- stats::runif(length(cens_times)) < p_mark_use
-      cens_times <- cens_times[keep]
+      # cens_times <- cens_times[keep]
     }
 
     # Add small jitter (optional) to mimic reading marks from an image
