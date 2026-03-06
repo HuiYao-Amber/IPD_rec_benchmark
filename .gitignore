@@ -1,0 +1,24 @@
+# RStudio 相关
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+*.Rproj.user
+
+# 临时文件
+*.Rapp.history
+*.RDataTmp
+*.Rtmp
+*.Rbak
+
+# 输出文件夹（根据你的实际情况）
+benchmark_results_*/
+meta_benchmark_results_*/
+R_meta/*.png
+R_meta/*.pdf
+R/single_trial_case_demo*/
+
+# 其他
+.DS_Store
+Thumbs.db
